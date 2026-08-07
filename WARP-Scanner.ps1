@@ -147,6 +147,146 @@ try {
 } catch {}
 
 # -----------------------------------------------------------------------------
+# STEP 0: ENVIRONMENT PRE-CHECK & VERSION CHECK (Runs immediately at startup)
+# -----------------------------------------------------------------------------
+Write-Header "Step 0: Environment Pre-Check & Version Check"
+
+$preCheckPassed = $true
+
+# --- Check 0.1: Script Version / Hash check against GitHub ---
+Write-Info "Checking script version against GitHub main branch..."
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+    $rawUrl = "https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/WARP-Scanner.ps1"
+    $req = [System.Net.WebRequest]::Create($rawUrl)
+    $req.Timeout = 4000
+    $resp = $req.GetResponse()
+    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $remoteContent = $reader.ReadToEnd()
+    $reader.Close()
+    $resp.Close()
+
+    if ($remoteContent) {
+        $remoteNorm = $remoteContent -replace "`r`n", "`n"
+        $localRaw   = Get-Content -Path $PSCommandPath -Raw
+        $localNorm  = $localRaw -replace "`r`n", "`n"
+
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $remoteHashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($remoteNorm))
+        $localHashBytes  = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($localNorm))
+        $remoteHash = ([System.BitConverter]::ToString($remoteHashBytes)).Replace("-","").ToLower()
+        $localHash  = ([System.BitConverter]::ToString($localHashBytes)).Replace("-","").ToLower()
+
+        if ($localHash -eq $remoteHash) {
+            Write-Host "  [PASS] Script version is up to date (matches GitHub main branch)." -ForegroundColor Green
+        } else {
+            Write-Host "  [WARN] Update available or local file modified." -ForegroundColor Yellow
+            Write-Host "         Your local script hash does not match latest GitHub version." -ForegroundColor Yellow
+            Write-Host "         To update, run:" -ForegroundColor Cyan
+            Write-Host "         iwr -useb https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/WARP-Scanner.ps1 -OutFile WARP-Scanner.ps1" -ForegroundColor Cyan
+            Write-Host ""
+            $upChoice = Read-Host "  Press Enter to continue with current version, or type UPDATE to exit and update"
+            if ($upChoice.Trim().ToUpper() -eq "UPDATE") {
+                Write-Host "  Exiting to allow update." -ForegroundColor Yellow
+                exit 0
+            }
+        }
+    }
+} catch {
+    Write-Host "  [*] Could not check version (Offline or GitHub unreachable). Proceeding..." -ForegroundColor Gray
+}
+
+# --- Check 0.2: Active WireGuard tunnel services ---
+Write-Info "Checking for active WireGuard tunnel services..."
+$activeTunnels = Get-Service -Name "WireGuardTunnel$*" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Status -eq "Running" }
+
+if ($activeTunnels) {
+    Write-Host "  [WARN] Active WireGuard tunnels found:" -ForegroundColor Yellow
+    foreach ($t in $activeTunnels) {
+        Write-Host "         $($t.ServiceName) ($($t.Status))" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Having an active WireGuard tunnel will interfere with the scan." -ForegroundColor Yellow
+    Write-Host "  The script installs its own test tunnels during Step 5." -ForegroundColor Yellow
+    Write-Host "  Running two tunnels at the same time causes false failures." -ForegroundColor Yellow
+    Write-Host ""
+    $killChoice = Read-Host "  Type STOP to remove them now, or press Enter to continue anyway"
+    if ($killChoice.Trim().ToUpper() -eq "STOP") {
+        # Resolve WireGuard path early for cleanup
+        $earlyWgPath = $WIREGUARD_PATH
+        $cmdWgEarly = Get-Command "wireguard.exe" -ErrorAction SilentlyContinue
+        if ($cmdWgEarly) { $earlyWgPath = $cmdWgEarly.Source }
+        foreach ($t in $activeTunnels) {
+            $tName = $t.ServiceName.Replace("WireGuardTunnel$", "")
+            Remove-WarpTunnelService -TunnelName $tName -WireGuardExePath $earlyWgPath
+        }
+        Write-Success "Active tunnels removed. Continuing."
+    } else {
+        Write-Warn "Continuing with active tunnel. Results may be unreliable."
+    }
+} else {
+    Write-Host "  [PASS] No active WireGuard tunnel services detected." -ForegroundColor Green
+}
+
+# --- Check 0.3: Active WARP app process ---
+Write-Info "Checking for running Cloudflare WARP app process..."
+$warpProc = Get-Process -Name "warp-svc","Cloudflare WARP" -ErrorAction SilentlyContinue
+if ($warpProc) {
+    Write-Host "  [WARN] Cloudflare WARP app is currently running." -ForegroundColor Yellow
+    Write-Host "         Process: $($warpProc.Name -join ', ')" -ForegroundColor Yellow
+    Write-Host "         Please disconnect from WARP in the system tray before scanning." -ForegroundColor Yellow
+    Write-Host ""
+    $warpChoice = Read-Host "  Press Enter to continue anyway or Ctrl+C to exit and disconnect WARP first"
+    Write-Warn "Continuing with WARP app running. Tunnel tests may fail."
+} else {
+    Write-Host "  [PASS] No Cloudflare WARP app process detected." -ForegroundColor Green
+}
+
+# --- Check 0.4: Basic internet connectivity (ping 1.1.1.1) ---
+Write-Info "Checking basic internet connectivity (ping 1.1.1.1)..."
+try {
+    $ping  = New-Object System.Net.NetworkInformation.Ping
+    $reply = $ping.Send("1.1.1.1", 3000)
+    if ($reply.Status -eq "Success") {
+        Write-Host "  [PASS] Internet is reachable. Ping 1.1.1.1 replied in $($reply.RoundtripTime) ms." -ForegroundColor Green
+    } else {
+        Write-Host "  [WARN] Ping to 1.1.1.1 returned status: $($reply.Status)." -ForegroundColor Yellow
+        Write-Host "         ICMP may be blocked on your network. Scan will still attempt TCP probes." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  [WARN] Ping test failed: $_" -ForegroundColor Yellow
+    Write-Host "         This may mean ICMP is blocked, not necessarily that internet is down." -ForegroundColor Yellow
+}
+
+# --- Check 0.5: DNS resolution test ---
+Write-Info "Checking DNS resolution (resolving cloudflare.com)..."
+try {
+    $dns = [System.Net.Dns]::GetHostAddresses("cloudflare.com")
+    if ($dns.Count -gt 0) {
+        Write-Host "  [PASS] DNS working. cloudflare.com resolved to $($dns[0].ToString())." -ForegroundColor Green
+    } else {
+        Write-Host "  [WARN] DNS returned no addresses for cloudflare.com." -ForegroundColor Yellow
+        $preCheckPassed = $false
+    }
+} catch {
+    Write-Host "  [FAIL] DNS resolution failed. Cannot resolve cloudflare.com." -ForegroundColor Red
+    Write-Host "         Your internet connection may not be working, or DNS is blocked." -ForegroundColor Yellow
+    $preCheckPassed = $false
+}
+
+Write-Host ""
+if ($preCheckPassed) {
+    Write-Success "Pre-check complete. All critical checks passed. Proceeding with scan."
+} else {
+    Write-Warn "Pre-check complete. One or more checks failed. The scan may not produce results."
+    Write-Host "  Check your network connection before continuing." -ForegroundColor Yellow
+    Write-Host ""
+    $proceed = Read-Host "  Type YES to proceed anyway or press Enter to exit"
+    if ($proceed.Trim().ToUpper() -ne "YES") { exit 1 }
+}
+
+# -----------------------------------------------------------------------------
 # INTERACTIVE SELECTION MENU (When run without explicit switches)
 # -----------------------------------------------------------------------------
 if ($PSBoundParameters.Count -eq 0) {
@@ -205,146 +345,6 @@ if ($CleanUpOnly) {
         Write-Info "No active WireGuard tunnel services found."
     }
     exit 0
-}
-
-# -----------------------------------------------------------------------------
-# STEP 0: ENVIRONMENT PRE-CHECK
-# -----------------------------------------------------------------------------
-Write-Header "Step 0: Environment Pre-Check"
-
-$preCheckPassed = $true
-
-# --- Check 0.1: Active WireGuard tunnel services ---
-Write-Info "Checking for active WireGuard tunnel services..."
-$activeTunnels = Get-Service -Name "WireGuardTunnel$*" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Status -eq "Running" }
-
-if ($activeTunnels) {
-    Write-Host "  [WARN] Active WireGuard tunnels found:" -ForegroundColor Yellow
-    foreach ($t in $activeTunnels) {
-        Write-Host "         $($t.ServiceName) ($($t.Status))" -ForegroundColor Yellow
-    }
-    Write-Host ""
-    Write-Host "  Having an active WireGuard tunnel will interfere with the scan." -ForegroundColor Yellow
-    Write-Host "  The script installs its own test tunnels during Step 5." -ForegroundColor Yellow
-    Write-Host "  Running two tunnels at the same time causes false failures." -ForegroundColor Yellow
-    Write-Host ""
-    $killChoice = Read-Host "  Type STOP to remove them now, or press Enter to continue anyway"
-    if ($killChoice.Trim().ToUpper() -eq "STOP") {
-        # Resolve WireGuard path early for cleanup
-        $earlyWgPath = $WIREGUARD_PATH
-        $cmdWgEarly = Get-Command "wireguard.exe" -ErrorAction SilentlyContinue
-        if ($cmdWgEarly) { $earlyWgPath = $cmdWgEarly.Source }
-        foreach ($t in $activeTunnels) {
-            $tName = $t.ServiceName.Replace("WireGuardTunnel$", "")
-            Remove-WarpTunnelService -TunnelName $tName -WireGuardExePath $earlyWgPath
-        }
-        Write-Success "Active tunnels removed. Continuing."
-    } else {
-        Write-Warn "Continuing with active tunnel. Results may be unreliable."
-    }
-} else {
-    Write-Host "  [PASS] No active WireGuard tunnel services detected." -ForegroundColor Green
-}
-
-# --- Check 0.2: Active WARP app process ---
-Write-Info "Checking for running Cloudflare WARP app process..."
-$warpProc = Get-Process -Name "warp-svc","Cloudflare WARP" -ErrorAction SilentlyContinue
-if ($warpProc) {
-    Write-Host "  [WARN] Cloudflare WARP app is currently running." -ForegroundColor Yellow
-    Write-Host "         Process: $($warpProc.Name -join ', ')" -ForegroundColor Yellow
-    Write-Host "         Please disconnect from WARP in the system tray before scanning." -ForegroundColor Yellow
-    Write-Host ""
-    $warpChoice = Read-Host "  Press Enter to continue anyway or Ctrl+C to exit and disconnect WARP first"
-    Write-Warn "Continuing with WARP app running. Tunnel tests may fail."
-} else {
-    Write-Host "  [PASS] No Cloudflare WARP app process detected." -ForegroundColor Green
-}
-
-# --- Check 0.3: Basic internet connectivity (ping 1.1.1.1) ---
-Write-Info "Checking basic internet connectivity (ping 1.1.1.1)..."
-try {
-    $ping  = New-Object System.Net.NetworkInformation.Ping
-    $reply = $ping.Send("1.1.1.1", 3000)
-    if ($reply.Status -eq "Success") {
-        Write-Host "  [PASS] Internet is reachable. Ping 1.1.1.1 replied in $($reply.RoundtripTime) ms." -ForegroundColor Green
-    } else {
-        Write-Host "  [WARN] Ping to 1.1.1.1 returned status: $($reply.Status)." -ForegroundColor Yellow
-        Write-Host "         ICMP may be blocked on your network. Scan will still attempt TCP probes." -ForegroundColor Yellow
-    }
-} catch {
-    Write-Host "  [WARN] Ping test failed: $_" -ForegroundColor Yellow
-    Write-Host "         This may mean ICMP is blocked, not necessarily that internet is down." -ForegroundColor Yellow
-}
-
-# --- Check 0.4: DNS resolution test ---
-Write-Info "Checking DNS resolution (resolving cloudflare.com)..."
-try {
-    $dns = [System.Net.Dns]::GetHostAddresses("cloudflare.com")
-    if ($dns.Count -gt 0) {
-        Write-Host "  [PASS] DNS working. cloudflare.com resolved to $($dns[0].ToString())." -ForegroundColor Green
-    } else {
-        Write-Host "  [WARN] DNS returned no addresses for cloudflare.com." -ForegroundColor Yellow
-        $preCheckPassed = $false
-    }
-} catch {
-    Write-Host "  [FAIL] DNS resolution failed. Cannot resolve cloudflare.com." -ForegroundColor Red
-    Write-Host "         Your internet connection may not be working, or DNS is blocked." -ForegroundColor Yellow
-    $preCheckPassed = $false
-}
-
-# --- Check 0.5: Script Version / Hash check against GitHub ---
-Write-Info "Checking script version against GitHub main branch..."
-try {
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
-    $rawUrl = "https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/WARP-Scanner.ps1"
-    $req = [System.Net.WebRequest]::Create($rawUrl)
-    $req.Timeout = 4000
-    $resp = $req.GetResponse()
-    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-    $remoteContent = $reader.ReadToEnd()
-    $reader.Close()
-    $resp.Close()
-
-    if ($remoteContent) {
-        $remoteNorm = $remoteContent -replace "`r`n", "`n"
-        $localRaw   = Get-Content -Path $PSCommandPath -Raw
-        $localNorm  = $localRaw -replace "`r`n", "`n"
-
-        $sha256 = [System.Security.Cryptography.SHA256]::Create()
-        $remoteHashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($remoteNorm))
-        $localHashBytes  = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($localNorm))
-        $remoteHash = ([System.BitConverter]::ToString($remoteHashBytes)).Replace("-","").ToLower()
-        $localHash  = ([System.BitConverter]::ToString($localHashBytes)).Replace("-","").ToLower()
-
-        if ($localHash -eq $remoteHash) {
-            Write-Host "  [PASS] Script version is up to date (matches GitHub main branch)." -ForegroundColor Green
-        } else {
-            Write-Host "  [WARN] Update available or local file modified." -ForegroundColor Yellow
-            Write-Host "         Your local script hash does not match latest GitHub version." -ForegroundColor Yellow
-            Write-Host "         To update, run:" -ForegroundColor Cyan
-            Write-Host "         iwr -useb https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/WARP-Scanner.ps1 -OutFile WARP-Scanner.ps1" -ForegroundColor Cyan
-            Write-Host ""
-            $upChoice = Read-Host "  Press Enter to continue with current version, or type UPDATE to exit and update"
-            if ($upChoice.Trim().ToUpper() -eq "UPDATE") {
-                Write-Host "  Exiting to allow update." -ForegroundColor Yellow
-                exit 0
-            }
-        }
-    }
-} catch {
-    Write-Host "  [*] Could not check version (Offline or GitHub unreachable). Proceeding..." -ForegroundColor Gray
-}
-
-Write-Host ""
-if ($preCheckPassed) {
-    Write-Success "Pre-check complete. All critical checks passed. Proceeding with scan."
-} else {
-    Write-Warn "Pre-check complete. One or more checks failed. The scan may not produce results."
-    Write-Host "  Check your network connection before continuing." -ForegroundColor Yellow
-    Write-Host ""
-    $proceed = Read-Host "  Type YES to proceed anyway or press Enter to exit"
-    if ($proceed.Trim().ToUpper() -ne "YES") { exit 1 }
 }
 
 # -----------------------------------------------------------------------------

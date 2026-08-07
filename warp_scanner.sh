@@ -485,6 +485,9 @@ main() {
     echo "======================================================================"
     echo "  Cloudflare WARP Scanner (Bash) by Tint Naing Win (@BadCodeWriter)"
     echo "======================================================================"
+
+    pre_check
+
     echo "  Select Scanning Mode:"
     echo "    [1] Standard Scan  (30 Candidate Tunnel Tests)"
     echo "    [2] Fast Scan      (15 Candidate Tunnel Tests)"
@@ -501,7 +504,6 @@ main() {
         *) MAX_TESTS=30 ;;
     esac
 
-    pre_check
     check_prerequisites
     register_account
     prescan_targets

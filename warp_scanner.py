@@ -593,6 +593,8 @@ def main():
     print("  Cloudflare WARP Scanner (Python) by Tint Naing Win (@BadCodeWriter)")
     print("======================================================================")
 
+    pre_check()
+
     threads = 100
     max_tests = 30
 
@@ -610,7 +612,6 @@ def main():
         elif choice == "4":
             sys.exit(0)
 
-    pre_check()
     check_prerequisites()
     profile = register_account()
     responsive = prescan_targets(threads=threads)

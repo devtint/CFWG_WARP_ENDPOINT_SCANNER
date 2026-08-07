@@ -97,6 +97,43 @@ pre_check() {
         PRE_CHECK_PASSED=0
     fi
 
+    # Check 0.5: Script Version / Hash check against GitHub
+    echo "[*] Checking script version against GitHub main branch..."
+    if REMOTE_SCRIPT=$(curl -sSL --max-time 4 https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/warp_scanner.sh 2>/dev/null) && [ -n "$REMOTE_SCRIPT" ]; then
+        calc_sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum | awk '{print $1}'
+            elif command -v shasum >/dev/null 2>&1; then
+                shasum -a 256 | awk '{print $1}'
+            elif command -v openssl >/dev/null 2>&1; then
+                openssl dgst -sha256 | awk '{print $NF}'
+            else
+                echo ""
+            fi
+        }
+
+        LOCAL_HASH=$(tr -d '\r' < "${BASH_SOURCE[0]}" | calc_sha256)
+        REMOTE_HASH=$(echo "$REMOTE_SCRIPT" | tr -d '\r' | calc_sha256)
+
+        if [ -n "$LOCAL_HASH" ] && [ -n "$REMOTE_HASH" ] && [ "$LOCAL_HASH" = "$REMOTE_HASH" ]; then
+            echo "  [PASS] Script version is up to date (matches GitHub main branch)."
+        elif [ -n "$LOCAL_HASH" ] && [ -n "$REMOTE_HASH" ]; then
+            echo "  [WARN] Update available or local file modified."
+            echo "         Your local script hash does not match latest GitHub version."
+            echo "         To update, run:"
+            echo "         curl -sSL https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/warp_scanner.sh -o warp_scanner.sh"
+            printf "  Press Enter to continue with current version, or type UPDATE to exit: "
+            read -r up_choice
+            if [ "$(echo "$up_choice" | tr '[:lower:]' '[:upper:]')" = "UPDATE" ]; then
+                exit 0
+            fi
+        else
+            echo "  [*] Could not compute hash. Proceeding with current version..."
+        fi
+    else
+        echo "  [*] Could not check version (Offline or GitHub unreachable). Proceeding..."
+    fi
+
     echo ""
     if [ "$PRE_CHECK_PASSED" -eq 1 ]; then
         echo "[+] Pre-check complete. All critical checks passed. Proceeding with scan."

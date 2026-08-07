@@ -14,6 +14,7 @@ import time
 import json
 import shutil
 import socket
+import hashlib
 import urllib.request
 import subprocess
 from pathlib import Path
@@ -168,7 +169,34 @@ def pre_check():
         print("         Your internet may not be working or DNS is blocked.")
         all_passed = False
 
-    print()
+    # Check 0.5: Script version / hash check against GitHub
+    print("[*] Checking script version against GitHub main branch...")
+    try:
+        url = "https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/warp_scanner.py"
+        req = urllib.request.Request(url, headers={"User-Agent": "WARP-Scanner-Python"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            remote_bytes = resp.read().decode("utf-8", errors="ignore")
+
+        local_bytes = Path(__file__).read_text(encoding="utf-8", errors="ignore")
+
+        remote_norm = remote_bytes.replace("\r\n", "\n")
+        local_norm = local_bytes.replace("\r\n", "\n")
+
+        remote_hash = hashlib.sha256(remote_norm.encode("utf-8")).hexdigest()
+        local_hash = hashlib.sha256(local_norm.encode("utf-8")).hexdigest()
+
+        if local_hash == remote_hash:
+            print("  [PASS] Script version is up to date (matches GitHub main branch).")
+        else:
+            print("  [WARN] Update available or local file modified.")
+            print("         Your local script hash does not match latest GitHub version.")
+            print("         To update, run:")
+            print("         curl -sSL https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/warp_scanner.py -o warp_scanner.py")
+            choice = input("  Press Enter to continue with current version, or type UPDATE to exit: ").strip().upper()
+            if choice == "UPDATE":
+                sys.exit(0)
+    except Exception:
+        print("  [*] Could not check version (Offline or GitHub unreachable). Proceeding...")
     if all_passed:
         print("[+] Pre-check complete. All critical checks passed. Proceeding with scan.")
     else:

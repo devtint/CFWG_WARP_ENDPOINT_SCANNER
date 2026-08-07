@@ -293,6 +293,49 @@ try {
     $preCheckPassed = $false
 }
 
+# --- Check 0.5: Script Version / Hash check against GitHub ---
+Write-Info "Checking script version against GitHub main branch..."
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+    $rawUrl = "https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/WARP-Scanner.ps1"
+    $req = [System.Net.WebRequest]::Create($rawUrl)
+    $req.Timeout = 4000
+    $resp = $req.GetResponse()
+    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $remoteContent = $reader.ReadToEnd()
+    $reader.Close()
+    $resp.Close()
+
+    if ($remoteContent) {
+        $remoteNorm = $remoteContent -replace "`r`n", "`n"
+        $localRaw   = Get-Content -Path $PSCommandPath -Raw
+        $localNorm  = $localRaw -replace "`r`n", "`n"
+
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $remoteHashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($remoteNorm))
+        $localHashBytes  = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($localNorm))
+        $remoteHash = ([System.BitConverter]::ToString($remoteHashBytes)).Replace("-","").ToLower()
+        $localHash  = ([System.BitConverter]::ToString($localHashBytes)).Replace("-","").ToLower()
+
+        if ($localHash -eq $remoteHash) {
+            Write-Host "  [PASS] Script version is up to date (matches GitHub main branch)." -ForegroundColor Green
+        } else {
+            Write-Host "  [WARN] Update available or local file modified." -ForegroundColor Yellow
+            Write-Host "         Your local script hash does not match latest GitHub version." -ForegroundColor Yellow
+            Write-Host "         To update, run:" -ForegroundColor Cyan
+            Write-Host "         iwr -useb https://raw.githubusercontent.com/devtint/CFWG_WARP_ENDPOINT_SCANNER/main/WARP-Scanner.ps1 -OutFile WARP-Scanner.ps1" -ForegroundColor Cyan
+            Write-Host ""
+            $upChoice = Read-Host "  Press Enter to continue with current version, or type UPDATE to exit and update"
+            if ($upChoice.Trim().ToUpper() -eq "UPDATE") {
+                Write-Host "  Exiting to allow update." -ForegroundColor Yellow
+                exit 0
+            }
+        }
+    }
+} catch {
+    Write-Host "  [*] Could not check version (Offline or GitHub unreachable). Proceeding..." -ForegroundColor Gray
+}
+
 Write-Host ""
 if ($preCheckPassed) {
     Write-Success "Pre-check complete. All critical checks passed. Proceeding with scan."

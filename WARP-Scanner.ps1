@@ -286,77 +286,235 @@ try {
 # -----------------------------------------------------------------------------
 # STEP 2: CLOUDFLARE ACCOUNT REGISTRATION & PROFILE PARSING
 # -----------------------------------------------------------------------------
+
+# Internal helper: tests if a TCP connection to a host:port can be opened
+function Test-TcpReachable {
+    param([string]$Hostname, [int]$Port, [int]$TimeoutMs = 4000)
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $ar  = $tcp.BeginConnect($Hostname, $Port, $null, $null)
+        $ok  = $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+        if ($ok -and $tcp.Connected) {
+            $tcp.Close()
+            return $true
+        }
+        $tcp.Close()
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+# Internal helper: tries to parse a profile file and returns a hashtable or $null
+function Read-WgcfProfile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    $raw = Get-Content -Path $Path -Raw
+    $pk  = if ($raw -match "PrivateKey\s*=\s*(.+)") { $matches[1].Trim() } else { $null }
+    $ad  = if ($raw -match "Address\s*=\s*(.+)")    { $matches[1].Trim() } else { $null }
+    $dn  = if ($raw -match "DNS\s*=\s*(.+)")        { $matches[1].Trim() } else { $null }
+    $pub = if ($raw -match "PublicKey\s*=\s*(.+)")  { $matches[1].Trim() } else { $null }
+    $res = if ($raw -match "Reserved\s*=\s*(.+)")   { $matches[1].Trim() } else { $null }
+    if (-not $pk -or -not $pub -or -not $ad) { return $null }
+    return @{ PrivateKey = $pk; Address = $ad; DNS = $dn; PublicKey = $pub; Reserved = $res }
+}
+
 try {
     Write-Header "Step 2: Cloudflare Account Registration & Key Extraction"
 
     $accountFile = Join-Path $WORKING_DIR "wgcf-account.toml"
     $profileFile = Join-Path $WORKING_DIR "wgcf-profile.conf"
 
-    # Register if account doesn't exist
-    if (-not (Test-Path $accountFile)) {
-        Write-Info "Registering new Cloudflare WARP account via wgcf..."
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName = $WGCF_EXE
-        $pinfo.Arguments = "register --accept-tos"
-        $pinfo.WorkingDirectory = $WORKING_DIR
-        $pinfo.UseShellExecute = $false
-        $pinfo.RedirectStandardOutput = $true
-        $pinfo.RedirectStandardError = $true
-
-        $proc = [System.Diagnostics.Process]::Start($pinfo)
-        $proc.WaitForExit(15000)
-        
-        if ($proc.ExitCode -ne 0) {
-            $errOut = $proc.StandardError.ReadToEnd()
-            Write-Warn "wgcf register warning/output: $errOut"
-        }
+    # ------------------------------------------------------------------
+    # FAST PATH: existing valid profile from a previous run
+    # If the user already has a working wgcf-profile.conf, skip everything.
+    # ------------------------------------------------------------------
+    $existingProfile = Read-WgcfProfile -Path $profileFile
+    if ($existingProfile) {
+        Write-Success "Existing valid wgcf-profile.conf found. Skipping registration."
     } else {
-        Write-Success "Existing Cloudflare WARP account file detected."
+        # ------------------------------------------------------------------
+        # PRE-CHECK: test API reachability BEFORE running wgcf
+        # This gives a clean, instant error instead of waiting for wgcf to
+        # fail with a cryptic Go stack trace.
+        # ------------------------------------------------------------------
+        Write-Info "Checking reachability of api.cloudflareclient.com before registration..."
+        $apiReachable = Test-TcpReachable -Hostname "api.cloudflareclient.com" -Port 443 -TimeoutMs 5000
+
+        if (-not $apiReachable) {
+            Write-Host ""
+            Write-Warn "Cannot reach api.cloudflareclient.com on port 443."
+            Write-Host ""
+            Write-Host "  What this means:" -ForegroundColor Yellow
+            Write-Host "  Your current network is blocking Cloudflare's WARP registration server." -ForegroundColor Yellow
+            Write-Host "  wgcf cannot create a new account without reaching this server." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Your options:" -ForegroundColor Cyan
+            Write-Host "  A) Switch to mobile hotspot, run this script there once, then copy" -ForegroundColor Cyan
+            Write-Host "     wgcf-account.toml back to this folder and run the script again." -ForegroundColor Cyan
+            Write-Host "  B) Ask someone on an open network to run wgcf register and send" -ForegroundColor Cyan
+            Write-Host "     you their wgcf-account.toml file." -ForegroundColor Cyan
+            Write-Host "  C) Place an existing wgcf-profile.conf in this folder and run again." -ForegroundColor Cyan
+            Write-Host ""
+
+            $choice = Read-Host "  Press Enter to exit, or type SKIP to try registration anyway"
+            if ($choice.Trim().ToUpper() -ne "SKIP") {
+                exit 1
+            }
+            Write-Warn "Skipping pre-check. Attempting registration anyway..."
+        } else {
+            Write-Success "api.cloudflareclient.com is reachable. Proceeding with registration."
+        }
+
+        # ------------------------------------------------------------------
+        # REGISTRATION
+        # ------------------------------------------------------------------
+        if (-not (Test-Path $accountFile)) {
+            Write-Info "Registering new Cloudflare WARP account via wgcf..."
+
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName        = $WGCF_EXE
+            $pinfo.Arguments       = "register --accept-tos"
+            $pinfo.WorkingDirectory = $WORKING_DIR
+            $pinfo.UseShellExecute  = $false
+            $pinfo.RedirectStandardOutput = $true
+            $pinfo.RedirectStandardError  = $true
+
+            $proc             = [System.Diagnostics.Process]::Start($pinfo)
+            $registerFinished = $proc.WaitForExit(25000)
+            $stdOut           = $proc.StandardOutput.ReadToEnd()
+            $stdErr           = $proc.StandardError.ReadToEnd()
+            $combined         = "$stdOut $stdErr"
+
+            if (-not $registerFinished) {
+                try { $proc.Kill() } catch {}
+                Write-Err "Registration timed out after 25 seconds."
+                Write-Host ""
+                Write-Host "  The network is responding but very slowly. This often means" -ForegroundColor Yellow
+                Write-Host "  the ISP is throttling rather than outright blocking the connection." -ForegroundColor Yellow
+                Write-Host "  Try on a different network or wait a few minutes and try again." -ForegroundColor Cyan
+                exit 1
+            }
+
+            if ($proc.ExitCode -ne 0) {
+                Write-Host ""
+                Write-Host "  Registration failed. Reading error output..." -ForegroundColor Yellow
+                Write-Host ""
+
+                if ($combined -match "refused|connectex|No connection could be made|actively refused") {
+                    Write-Err "Connection was actively refused by the ISP or network firewall."
+                    Write-Host ""
+                    Write-Host "  The pre-check passed but the actual registration was blocked." -ForegroundColor Yellow
+                    Write-Host "  The ISP may be doing deep packet inspection and blocking" -ForegroundColor Yellow
+                    Write-Host "  specifically the /reg API path while allowing other HTTPS traffic." -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "  Option A: Switch to mobile hotspot and run this script there first." -ForegroundColor Cyan
+                    Write-Host "  Option B: Place someone else's wgcf-account.toml here and rerun." -ForegroundColor Cyan
+                    Write-Host "  Option C: Place a ready wgcf-profile.conf here and rerun." -ForegroundColor Cyan
+                }
+                elseif ($combined -match "timeout|timed out|deadline|context deadline") {
+                    Write-Err "Registration connection timed out while waiting for a response."
+                    Write-Host ""
+                    Write-Host "  The server was reached but did not respond in time." -ForegroundColor Yellow
+                    Write-Host "  Try again in a few minutes, or switch to mobile hotspot." -ForegroundColor Cyan
+                }
+                elseif ($combined -match "TLS|certificate|x509|ssl|handshake") {
+                    Write-Err "TLS handshake failed. A proxy or firewall is intercepting HTTPS."
+                    Write-Host ""
+                    Write-Host "  Something between your computer and Cloudflare is intercepting" -ForegroundColor Yellow
+                    Write-Host "  the encrypted connection. This could be a corporate firewall," -ForegroundColor Yellow
+                    Write-Host "  antivirus SSL scanning, or a network proxy." -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host "  Try disabling any antivirus SSL scanning or switch to mobile hotspot." -ForegroundColor Cyan
+                }
+                elseif ($combined -match "rate limit|too many|429") {
+                    Write-Err "Cloudflare rate-limited this registration attempt."
+                    Write-Host ""
+                    Write-Host "  Too many registration attempts were made from this IP recently." -ForegroundColor Yellow
+                    Write-Host "  Wait 10 to 15 minutes and try again." -ForegroundColor Cyan
+                }
+                else {
+                    Write-Err "wgcf register failed with an unrecognised error."
+                    Write-Host ""
+                    Write-Host "  Error output:" -ForegroundColor Yellow
+                    Write-Host "  $combined" -ForegroundColor DarkGray
+                }
+
+                exit 1
+            }
+
+            Write-Success "Cloudflare WARP account registered successfully."
+
+        } else {
+            Write-Success "Existing wgcf-account.toml found. Skipping registration step."
+        }
+
+        # ------------------------------------------------------------------
+        # PROFILE GENERATION
+        # ------------------------------------------------------------------
+        Write-Info "Generating WireGuard profile via wgcf..."
+
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName        = $WGCF_EXE
+        $pinfo.Arguments       = "generate"
+        $pinfo.WorkingDirectory = $WORKING_DIR
+        $pinfo.UseShellExecute  = $false
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError  = $true
+
+        $proc        = [System.Diagnostics.Process]::Start($pinfo)
+        $genFinished = $proc.WaitForExit(15000)
+        $genErr      = $proc.StandardError.ReadToEnd()
+
+        if (-not $genFinished) {
+            try { $proc.Kill() } catch {}
+            Write-Err "Profile generation timed out."
+            Write-Host "  Delete wgcf-account.toml and run again to start fresh." -ForegroundColor Cyan
+            exit 1
+        }
+
+        if (-not (Test-Path $profileFile)) {
+            Write-Err "wgcf generate ran but wgcf-profile.conf was not created."
+            Write-Host ""
+            Write-Host "  The account file may be corrupt or the account may have been revoked." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Delete wgcf-account.toml from this folder and run the script again" -ForegroundColor Cyan
+            Write-Host "  to register a fresh account." -ForegroundColor Cyan
+            if ($genErr) { Write-Host "  Raw error: $genErr" -ForegroundColor DarkGray }
+            exit 1
+        }
+
+        Write-Success "wgcf-profile.conf generated."
+        $existingProfile = Read-WgcfProfile -Path $profileFile
+
+        if (-not $existingProfile) {
+            Write-Err "Profile file was created but is missing required keys."
+            Write-Host ""
+            Write-Host "  Delete both wgcf-account.toml and wgcf-profile.conf and run again." -ForegroundColor Cyan
+            exit 1
+        }
     }
 
-    # Generate profile
-    Write-Info "Generating WireGuard profile via wgcf..."
-    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pinfo.FileName = $WGCF_EXE
-    $pinfo.Arguments = "generate"
-    $pinfo.WorkingDirectory = $WORKING_DIR
-    $pinfo.UseShellExecute = $false
-    $pinfo.RedirectStandardOutput = $true
-    $pinfo.RedirectStandardError = $true
+    # ------------------------------------------------------------------
+    # EXPOSE PARSED KEYS TO THE REST OF THE SCRIPT
+    # ------------------------------------------------------------------
+    $privateKey = $existingProfile.PrivateKey
+    $address    = $existingProfile.Address
+    $dns        = $existingProfile.DNS
+    $publicKey  = $existingProfile.PublicKey
+    $reserved   = $existingProfile.Reserved
 
-    $proc = [System.Diagnostics.Process]::Start($pinfo)
-    $proc.WaitForExit(15000)
-
-    if (-not (Test-Path $profileFile)) {
-        throw "Failed to generate '$profileFile'. Check wgcf installation."
-    }
-    Write-Success "Base profile generated: $profileFile"
-
-    # Parse profile configuration
-    $confContent = Get-Content -Path $profileFile -Raw
-
-    $privateKey = if ($confContent -match "PrivateKey\s*=\s*(.+)") { $matches[1].Trim() } else { $null }
-    $address    = if ($confContent -match "Address\s*=\s*(.+)")    { $matches[1].Trim() } else { $null }
-    $dns        = if ($confContent -match "DNS\s*=\s*(.+)")        { $matches[1].Trim() } else { $null }
-    $publicKey  = if ($confContent -match "PublicKey\s*=\s*(.+)")  { $matches[1].Trim() } else { $null }
-    $reserved   = if ($confContent -match "Reserved\s*=\s*(.+)")   { $matches[1].Trim() } else { $null }
-
-    if (-not $privateKey -or -not $publicKey -or -not $address) {
-        throw "Could not parse PrivateKey, PublicKey, or Address from $profileFile."
-    }
-
-    Write-Success "Profile parameters extracted:"
-    Write-Host "   - Address    : $address" -ForegroundColor Gray
-    Write-Host "   - DNS        : $dns" -ForegroundColor Gray
-    Write-Host "   - PublicKey  : $publicKey" -ForegroundColor Gray
-    if ($reserved) {
-        Write-Host "   - Reserved   : $reserved" -ForegroundColor Gray
-    }
+    Write-Success "Profile keys loaded."
+    Write-Host "   Address   : $address"  -ForegroundColor Gray
+    Write-Host "   DNS       : $dns"      -ForegroundColor Gray
+    Write-Host "   PublicKey : $publicKey" -ForegroundColor Gray
+    if ($reserved) { Write-Host "   Reserved  : $reserved" -ForegroundColor Gray }
 
 } catch {
-    Write-Err "Account registration / Profile parsing failed: $_"
+    Write-Err "Step 2 failed unexpectedly: $_"
     exit 1
 }
+
 
 # -----------------------------------------------------------------------------
 # STEP 3: MASS ENDPOINT GENERATION & RUNSPACE PRE-SCAN

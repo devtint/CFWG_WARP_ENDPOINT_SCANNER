@@ -12,10 +12,10 @@ ENGLISH SECTION
 
 CRITICAL WARNINGS BEFORE RUNNING
 1. TURN OFF ALL EXISTING VPNS FIRST
-Disconnect from any active VPN services including official Cloudflare WARP app, WireGuard, or third-party proxies before starting the scanner. Existing VPN connections will block local socket probes and cause false test failures.
+If you are already using a VPN app such as the official Cloudflare WARP app, WireGuard, or any other proxy tool, turn it off completely before running this scanner. A running VPN will interfere with the scan and cause it to produce wrong results. Your physical internet connection (WiFi or cable) must stay connected and working throughout the entire scan.
 
-2. DO NOT USE THE INTERNET WHILE SCANNING
-Do not play online games, join video calls, or run downloads while the scanner is running. During Step 5, the script dynamically installs and uninstalls test WireGuard tunnels to verify real connectivity, which will temporarily drop and reconnect your internet connection every few seconds.
+2. KEEP YOUR INTERNET ON BUT STOP HEAVY USAGE DURING SCANNING
+Your internet connection must remain switched on the entire time. Do not disconnect it. What you should avoid during the scan is running anything that needs a stable connection such as online games, video calls, or large file downloads. The reason is that during Step 5, the script briefly connects to and disconnects from dozens of test WireGuard tunnels one by one. Each test connection lasts only a few seconds. This causes your connection to blink on and off rapidly, which will interrupt any active session you have open.
 
 ONE-LINE DIRECT RUN COMMANDS (FASTEST)
 Method 1: Windows Administrator PowerShell (Recommended)
@@ -100,11 +100,11 @@ After the scan completes, your results are saved automatically inside the script
 ======================================================================
 
 မစတင်မီ အထူးသတိပြုရန် အချက်များ
-၁။ ချိတ်ဆက်ထားသော VPN များကို ခေတ္တပိတ်ထားပါ
-စကန်မဖတ်မီ စက်ထဲတွင် ပွင့်နေသော Cloudflare WARP သို့မဟုတ် အခြား VPN များကို ခေတ္တ ပိတ်ထားပေးပါ။ VPN ဖွင့်ထားပါက စကန်ဖတ်သည့်စနစ် အလုပ်လုပ်မည် မဟုတ်ပါ။
+၁။ ပွင့်နေသော VPN App များကို ပိတ်ပါ (အင်တာနက်ကို မပိတ်ပါနှင့်)
+ဤ Scanner မစတင်မီ သင့်စက်တွင် ဖွင့်ထားသော Cloudflare WARP App၊ WireGuard သို့မဟုတ် အခြား VPN App တစ်ခုခု ရှိပါက ထို App ကိုသာ ပိတ်ပေးပါ။ WiFi သို့မဟုတ် ကြိုး Internet ချိတ်ဆက်မှုကို မပိတ်ပါနှင့်။ Internet ချိတ်ဆက်မှု ဖွင့်ထားမှသာ Scanner အလုပ်လုပ်နိုင်မည် ဖြစ်ပါသည်။ VPN App ဖွင့်ထားပါက Scanner မှ ရလဒ်များ မှားယွင်းနိုင်ပါသည်။
 
-၂။ စကန်ဖတ်နေချိန်တွင် အင်တာနက် အသုံးပြုမှု ခေတ္တရပ်နားထားပါ
-စကန်ဖတ်နေစဉ်အတွင်း ဂိမ်းဆော့ခြင်း၊ ဗီဒီယို ကောလ် ပြောခြင်း သို့မဟုတ် ဖိုင်ဒေါင်းလုဒ် ဆွဲခြင်းများ မပြုလုပ်ပါနှင့်။ အစမ်းလိုင်းများကို တစ်ခုချင်း ချိတ်ဆက် စမ်းသပ်နေသည့်အတွက် အင်တာနက်လိုင်း မိနစ်ပိုင်းမျှ ခေတ္တ ခဏ ပြတ်တောက်နိုင်ပါသည်။
+၂။ Internet ဖွင့်ထားပါ သို့သော် စကန်ဖတ်နေစဉ် အသုံးများသော ကိစ္စများ ခေတ္တရပ်နားပါ
+စကန်ဖတ်နေစဉ် Internet ချိတ်ဆက်မှုကို ဖွင့်ထားရပါမည်။ ပိတ်ခြင်း မပြုပါနှင့်။ သို့သော် ဂိမ်းဆော့ခြင်း၊ Video Call ပြောခြင်း သို့မဟုတ် ဖိုင်ကြီးများ ဒေါင်းလုဒ်ဆွဲခြင်းများကို ယာယီ ရပ်နားထားပါ။ အကြောင်းမှာ Step 5 တွင် Script သည် WireGuard Tunnel တစ်ခုချင်းစီကို ချိတ်ဆက် စမ်းသပ်ပြီး ဖြုတ်ကာ တစ်ခုပြီး တစ်ခု စစ်ဆေးနေမည် ဖြစ်သည်။ ထိုအချိန်တွင် Internet လိုင်း ဆက်တိုက် ခဏခဏ ပြတ်တောက်ကာ ပြန်ချိတ်ဆက်မည် ဖြစ်သဖြင့် ချိတ်ဆက်မှု မတည်ငြိမ်မှုကို မှီခိုနေသော ကိစ္စများ ကြားဖြတ်ပြတ်တောက်နိုင်ပါသည်။
 
 တစ်လိုင်းတည်းဖြင့် တိုက်ရိုက် RUN နည်း (အမြန်ဆုံးနည်းလမ်း)
 နည်းလမ်း ၁ - Windows PowerShell (Admin) အတွက် (အကြံပြုချက်)
@@ -146,3 +146,53 @@ Windows အတွက် (PowerShell)
 * Working_Configs ဖိုင်တွဲ - ချိတ်ဆက်မှု အဆင်ပြေသော WireGuard .conf ဖိုင်များ သိမ်းဆည်းထားသည့် နေရာ ဖြစ်ပါသည်။ ထိုဖိုင်များကို WireGuard App ထဲသို့ တိုက်ရိုက် Import လုပ်၍ အသုံးပြုနိုင်ပါသည်။
 * working_endpoints.csv - လိုင်းအမြန်နှုန်း Ping latency အလိုက် အစဉ်လိုက် စီပေးထားသော ဇယားဖိုင် ဖြစ်ပါသည်။
 * working_endpoints.txt - စမ်းသပ်အောင်မြင်သော IP များနှင့် တည်နေရာ အချက်အလက်များ ပါဝင်သော စာသားဖိုင် ဖြစ်ပါသည်။
+
+
+======================================================================
+WHAT THIS TOOL DOES AND DOES NOT DO (ENGLISH)
+======================================================================
+This scanner finds Cloudflare WARP endpoints that are currently reachable on your network and generates WireGuard configuration files for them. It does not modify your system, install persistent software, or send your data anywhere.
+
+WHAT CLOUDFLARE WARP PROVIDES
+* Free with no advertisements and no usage limits on the free tier.
+* Encrypts traffic between your device and Cloudflare's nearest server.
+* Bypasses ISP-level port blocking and basic traffic filtering.
+* Cloudflare operates one of the largest networks in the world, meaning latency is generally low.
+* Cloudflare's published privacy policy commits to not selling or sharing user traffic data with third parties.
+
+WHAT CLOUDFLARE WARP DOES NOT PROVIDE
+* Full anonymity. Cloudflare can see your connection metadata including your real IP address and the domains you visit.
+* Protection against deep packet inspection that specifically targets WireGuard's protocol fingerprint.
+* A guarantee that every endpoint found will remain reachable. Network conditions change and endpoints that work today may not work tomorrow.
+* Protection at the device level. If your device itself is monitored, WARP does not change that.
+
+WHO THIS IS FOR
+This tool is suitable for users on networks where services are filtered at the ISP level and who need a free, low-latency solution that does not involve trusting unknown third parties or installing ad-supported applications.
+
+WHO SHOULD CONSIDER OTHER OPTIONS
+If you require strong anonymity or need to protect your identity from a sophisticated monitoring capability, a properly configured Tor setup or a paid audited VPN provider with a verified no-log policy is a more appropriate choice than WARP.
+
+
+======================================================================
+ဤ Tool ဖြင့် ဘာကို လုပ်နိုင်သည်၊ ဘာကို မလုပ်နိုင် (မြန်မာဘာသာ)
+======================================================================
+ဤ Scanner သည် သင့်ကွန်ရက်ပေါ်တွင် လက်ရှိ ချိတ်ဆက်နိုင်သော Cloudflare WARP Endpoint များကို ရှာဖွေပေးပြီး WireGuard Configuration ဖိုင်များ ထုတ်ပေးသည်။ ဤ Script သည် သင့်စနစ်ကို မည်သည့်နည်းဖြင့်မျှ မပြောင်းလဲဘဲ၊ နောက်ခံ Software တင်ခြင်း မပြုသည့်အပြင် သင့်ဒေတာများကိုလည်း မည်သည့်နေရာသို့မျှ မပို့ပါ။
+
+Cloudflare WARP ဖြင့် ရနိုင်သည့် အကျိုးကျေးဇူးများ
+* အခမဲ့ သုံးနိုင်ပြီး ကြော်ငြာ မပါဝင်ဘဲ Data Limit လည်း မရှိပါ။
+* သင့်စက်မှ Cloudflare ၏ အနီးဆုံး Server အထိ Traffic ကို ကုဒ်ဝှက်ပေးပါသည်။
+* ISP အဆင့်တွင် ပိတ်ဆို့ထားသော Port များနှင့် အခြေခံ Traffic Filtering များကို ကျော်ဖြတ်နိုင်ပါသည်။
+* Cloudflare သည် ကမ္ဘာ့ကြီးမားသော Network တစ်ခုကို ပိုင်ဆိုင်သောကြောင့် Latency နည်းပါသည်။
+* Cloudflare ၏ Privacy Policy တွင် User ၏ Traffic ဒေတာများကို တတိယပါတီများသို့ ရောင်းချခြင်း သို့မဟုတ် မျှဝေခြင်း မပြုဟု တိတိကျကျ ဖော်ပြထားသည်။
+
+Cloudflare WARP ဖြင့် မရနိုင်သည့် အချက်များ
+* အပြည့်အဝ익名性 (Anonymity) မရပါ။ Cloudflare သည် သင့် IP Address နှင့် ဝင်ရောက်သည့် Domain များကို မြင်နိုင်ပါသည်။
+* WireGuard Protocol ကို တိကျစွာ ပစ်မှတ်ထားသည့် Deep Packet Inspection ကို ကာကွယ်နိုင်ခြင်း မရှိပါ။
+* ယနေ့ အလုပ်လုပ်သော Endpoint များ နောက်တစ်နေ့တွင်လည်း အလုပ်လုပ်မည်ဟု အာမမခံနိုင်ပါ။ Network အခြေအနေများ ပြောင်းလဲနေပါသည်။
+* Device အဆင့် စောင့်ကြည့်မှုကို ကာကွယ်ပေးနိုင်ခြင်း မရှိပါ။ သင့်စက်ကို တိုက်ရိုက် စောင့်ကြည့်နေပါက WARP ဖြင့် ကာကွယ်ရန် မဖြစ်နိုင်ပါ။
+
+ဤ Tool ကို မည်သူများအတွက် သင့်တော်သည်
+ISP အဆင့်တွင် Service များ ပိတ်ဆို့ စစ်ထုတ်ထားသော ကွန်ရက်ပေါ်ရှိ သုံးစွဲသူများနှင့် ကြော်ငြာများ ပါဝင်သော Application များ သို့မဟုတ် မသိသော တတိယပါတီများကို မှီခိုစရာ မလိုဘဲ အခမဲ့ Latency နည်းသော ဖြေရှင်းချက် လိုအပ်သူများအတွက် သင့်တော်ပါသည်။
+
+အခြား နည်းလမ်းများကို စဉ်းစားသင့်သည့် အခြေအနေ
+အကယ်၍ သင်သည် ခိုင်မာသော익名性 (Anonymity) လိုအပ်သည် သို့မဟုတ် အဆင့်မြင့် Network စောင့်ကြည့်မှုမှ ကာကွယ်ရန် လိုသည်ဆိုပါက Tor သို့မဟုတ် No-Log Policy ကို စစ်ဆေးအတည်ပြုပြီးသော ငွေပေး VPN Provider တစ်ခုသည် WARP ထက် ပိုသင့်တော်ပါသည်။

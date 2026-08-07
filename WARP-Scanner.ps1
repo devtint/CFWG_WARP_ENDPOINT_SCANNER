@@ -208,6 +208,99 @@ if ($CleanUpOnly) {
 }
 
 # -----------------------------------------------------------------------------
+# STEP 0: ENVIRONMENT PRE-CHECK
+# -----------------------------------------------------------------------------
+Write-Header "Step 0: Environment Pre-Check"
+
+$preCheckPassed = $true
+
+# --- Check 0.1: Active WireGuard tunnel services ---
+Write-Info "Checking for active WireGuard tunnel services..."
+$activeTunnels = Get-Service -Name "WireGuardTunnel$*" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Status -eq "Running" }
+
+if ($activeTunnels) {
+    Write-Host "  [WARN] Active WireGuard tunnels found:" -ForegroundColor Yellow
+    foreach ($t in $activeTunnels) {
+        Write-Host "         $($t.ServiceName) ($($t.Status))" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Having an active WireGuard tunnel will interfere with the scan." -ForegroundColor Yellow
+    Write-Host "  The script installs its own test tunnels during Step 5." -ForegroundColor Yellow
+    Write-Host "  Running two tunnels at the same time causes false failures." -ForegroundColor Yellow
+    Write-Host ""
+    $killChoice = Read-Host "  Type STOP to remove them now, or press Enter to continue anyway"
+    if ($killChoice.Trim().ToUpper() -eq "STOP") {
+        foreach ($t in $activeTunnels) {
+            $tName = $t.ServiceName.Replace("WireGuardTunnel$", "")
+            Remove-WarpTunnelService -TunnelName $tName -WireGuardExePath $WIREGUARD_PATH
+        }
+        Write-Success "Active tunnels removed. Continuing."
+    } else {
+        Write-Warn "Continuing with active tunnel. Results may be unreliable."
+    }
+} else {
+    Write-Host "  [PASS] No active WireGuard tunnel services detected." -ForegroundColor Green
+}
+
+# --- Check 0.2: Active WARP app process ---
+Write-Info "Checking for running Cloudflare WARP app process..."
+$warpProc = Get-Process -Name "warp-svc","Cloudflare WARP" -ErrorAction SilentlyContinue
+if ($warpProc) {
+    Write-Host "  [WARN] Cloudflare WARP app is currently running." -ForegroundColor Yellow
+    Write-Host "         Process: $($warpProc.Name -join ', ')" -ForegroundColor Yellow
+    Write-Host "         Please disconnect from WARP in the system tray before scanning." -ForegroundColor Yellow
+    Write-Host ""
+    $warpChoice = Read-Host "  Press Enter to continue anyway or Ctrl+C to exit and disconnect WARP first"
+    Write-Warn "Continuing with WARP app running. Tunnel tests may fail."
+} else {
+    Write-Host "  [PASS] No Cloudflare WARP app process detected." -ForegroundColor Green
+}
+
+# --- Check 0.3: Basic internet connectivity (ping 1.1.1.1) ---
+Write-Info "Checking basic internet connectivity (ping 1.1.1.1)..."
+try {
+    $ping  = New-Object System.Net.NetworkInformation.Ping
+    $reply = $ping.Send("1.1.1.1", 3000)
+    if ($reply.Status -eq "Success") {
+        Write-Host "  [PASS] Internet is reachable. Ping 1.1.1.1 replied in $($reply.RoundtripTime) ms." -ForegroundColor Green
+    } else {
+        Write-Host "  [WARN] Ping to 1.1.1.1 returned status: $($reply.Status)." -ForegroundColor Yellow
+        Write-Host "         ICMP may be blocked on your network. Scan will still attempt TCP probes." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  [WARN] Ping test failed: $_" -ForegroundColor Yellow
+    Write-Host "         This may mean ICMP is blocked, not necessarily that internet is down." -ForegroundColor Yellow
+}
+
+# --- Check 0.4: DNS resolution test ---
+Write-Info "Checking DNS resolution (resolving cloudflare.com)..."
+try {
+    $dns = [System.Net.Dns]::GetHostAddresses("cloudflare.com")
+    if ($dns.Count -gt 0) {
+        Write-Host "  [PASS] DNS working. cloudflare.com resolved to $($dns[0].ToString())." -ForegroundColor Green
+    } else {
+        Write-Host "  [WARN] DNS returned no addresses for cloudflare.com." -ForegroundColor Yellow
+        $preCheckPassed = $false
+    }
+} catch {
+    Write-Host "  [FAIL] DNS resolution failed. Cannot resolve cloudflare.com." -ForegroundColor Red
+    Write-Host "         Your internet connection may not be working, or DNS is blocked." -ForegroundColor Yellow
+    $preCheckPassed = $false
+}
+
+Write-Host ""
+if ($preCheckPassed) {
+    Write-Success "Pre-check complete. All critical checks passed. Proceeding with scan."
+} else {
+    Write-Warn "Pre-check complete. One or more checks failed. The scan may not produce results."
+    Write-Host "  Check your network connection before continuing." -ForegroundColor Yellow
+    Write-Host ""
+    $proceed = Read-Host "  Type YES to proceed anyway or press Enter to exit"
+    if ($proceed.Trim().ToUpper() -ne "YES") { exit 1 }
+}
+
+# -----------------------------------------------------------------------------
 # STEP 1: PREREQUISITE & ENVIRONMENT CHECKS
 # -----------------------------------------------------------------------------
 try {

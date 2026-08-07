@@ -43,6 +43,73 @@ check_root() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# STEP 0: ENVIRONMENT PRE-CHECK
+# -----------------------------------------------------------------------------
+pre_check() {
+    echo ""
+    echo "======================================================================"
+    echo "  Step 0: Environment Pre-Check"
+    echo "======================================================================"
+
+    PRE_CHECK_PASSED=1
+
+    # Check 0.1: Active wg-quick tunnel interfaces
+    echo "[*] Checking for active WireGuard tunnel interfaces..."
+    if ip link show 2>/dev/null | grep -qE "warp_|^[0-9]+: wg"; then
+        echo "  [WARN] Active WireGuard interfaces detected on this system."
+        echo "         They may interfere with tunnel testing in Step 5."
+        printf "  Press Enter to continue anyway or Ctrl+C to exit first: "
+        read -r _
+    else
+        echo "  [PASS] No active WireGuard interfaces detected."
+    fi
+
+    # Check 0.2: Cloudflare WARP app process
+    echo "[*] Checking for Cloudflare WARP app process..."
+    if pgrep -x "warp-svc" >/dev/null 2>&1; then
+        echo "  [WARN] Cloudflare WARP service (warp-svc) is running."
+        echo "         Disconnect it before scanning to avoid interference."
+        printf "  Press Enter to continue anyway or Ctrl+C to exit: "
+        read -r _
+    else
+        echo "  [PASS] No Cloudflare WARP process detected."
+    fi
+
+    # Check 0.3: Basic internet connectivity
+    echo "[*] Checking basic internet connectivity (ping 1.1.1.1)..."
+    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+        echo "  [PASS] Internet is reachable. Ping 1.1.1.1 succeeded."
+    else
+        echo "  [WARN] Ping to 1.1.1.1 failed. ICMP may be blocked on your network."
+        echo "         Scan will still attempt UDP socket probes."
+    fi
+
+    # Check 0.4: DNS resolution
+    echo "[*] Checking DNS resolution (resolving cloudflare.com)..."
+    if RESOLVED=$(getent hosts cloudflare.com 2>/dev/null | awk '{print $1; exit}') && [ -n "$RESOLVED" ]; then
+        echo "  [PASS] DNS working. cloudflare.com resolved to ${RESOLVED}."
+    elif RESOLVED=$(host cloudflare.com 2>/dev/null | grep "has address" | head -1 | awk '{print $NF}') && [ -n "$RESOLVED" ]; then
+        echo "  [PASS] DNS working. cloudflare.com resolved to ${RESOLVED}."
+    else
+        echo "  [FAIL] DNS resolution failed. Cannot resolve cloudflare.com."
+        echo "         Your internet may not be working, or DNS is blocked."
+        PRE_CHECK_PASSED=0
+    fi
+
+    echo ""
+    if [ "$PRE_CHECK_PASSED" -eq 1 ]; then
+        echo "[+] Pre-check complete. All critical checks passed. Proceeding with scan."
+    else
+        echo "[!] Pre-check complete. One or more checks failed. Scan may not produce results."
+        printf "  Type YES to proceed anyway or press Enter to exit: "
+        read -r proceed
+        if [ "$(echo "$proceed" | tr '[:lower:]' '[:upper:]')" != "YES" ]; then
+            exit 1
+        fi
+    fi
+}
+
 check_prerequisites() {
     echo ""
     echo "======================================================================"
@@ -86,6 +153,9 @@ check_prerequisites() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# STEP 2: CLOUDFLARE ACCOUNT REGISTRATION & PROFILE PARSING
+# -----------------------------------------------------------------------------
 register_account() {
     echo ""
     echo "======================================================================"
@@ -95,16 +165,89 @@ register_account() {
     ACCOUNT_FILE="${WORKING_DIR}/wgcf-account.toml"
     PROFILE_FILE="${WORKING_DIR}/wgcf-profile.conf"
 
+    # Fast path: reuse existing valid profile
+    if [ -f "$PROFILE_FILE" ]; then
+        _pk=$(grep "PrivateKey" "$PROFILE_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d ' ')
+        _pub=$(grep "PublicKey" "$PROFILE_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d ' ')
+        if [ -n "$_pk" ] && [ -n "$_pub" ]; then
+            echo "[+] Existing valid wgcf-profile.conf found. Skipping registration."
+            PRIVATE_KEY=$_pk
+            ADDRESS=$(grep "Address" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+            DNS=$(grep "DNS" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+            PUBLIC_KEY=$_pub
+            RESERVED=$(grep "Reserved" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ' 2>/dev/null || true)
+            return 0
+        fi
+    fi
+
     if [ ! -f "$ACCOUNT_FILE" ]; then
+        # Pre-check API reachability
+        echo "[*] Checking reachability of api.cloudflareclient.com..."
+        if ! curl -s --connect-timeout 5 --max-time 5 -o /dev/null https://api.cloudflareclient.com 2>/dev/null; then
+            echo ""
+            echo "[!] Cannot reach api.cloudflareclient.com."
+            echo "    Your network is blocking Cloudflare's WARP registration server."
+            echo ""
+            echo "    Option A: Switch to mobile hotspot, run the script there once,"
+            echo "              then copy wgcf-account.toml back here and run again."
+            echo "    Option B: Ask someone on an open network to run wgcf register"
+            echo "              and send you their wgcf-account.toml file."
+            echo "    Option C: Place an existing wgcf-profile.conf here and run again."
+            echo ""
+            printf "  Press Enter to exit, or type SKIP to try anyway: "
+            read -r skip_choice
+            if [ "$(echo "$skip_choice" | tr '[:lower:]' '[:upper:]')" != "SKIP" ]; then
+                exit 1
+            fi
+            echo "[!] Skipping pre-check. Attempting registration anyway..."
+        else
+            echo "[+] api.cloudflareclient.com is reachable. Proceeding with registration."
+        fi
+
         echo "[*] Registering new Cloudflare WARP account..."
-        "$WGCF_BIN" register --accept-tos >/dev/null 2>&1
+        set +e
+        REG_OUTPUT=$("$WGCF_BIN" register --accept-tos 2>&1)
+        REG_EXIT=$?
+        set -e
+
+        if [ $REG_EXIT -ne 0 ]; then
+            echo ""
+            echo "[-] Registration failed. Diagnosing error..."
+            if echo "$REG_OUTPUT" | grep -qiE "refused|connectex|No connection|actively refused"; then
+                echo "[-] Connection was actively refused by the ISP or network firewall."
+                echo "    The /reg API path is being specifically blocked."
+                echo "    Switch to mobile hotspot or obtain wgcf-account.toml from another network."
+            elif echo "$REG_OUTPUT" | grep -qiE "timeout|timed out|deadline"; then
+                echo "[-] Connection timed out waiting for Cloudflare's server."
+                echo "    Try again in a few minutes or switch to mobile hotspot."
+            elif echo "$REG_OUTPUT" | grep -qiE "TLS|certificate|x509|ssl|handshake"; then
+                echo "[-] TLS handshake failed. A proxy or firewall is intercepting HTTPS."
+                echo "    Try disabling antivirus SSL scanning or switch to mobile hotspot."
+            elif echo "$REG_OUTPUT" | grep -qiE "429|rate limit|too many"; then
+                echo "[-] Cloudflare rate-limited this registration attempt."
+                echo "    Wait 10 to 15 minutes and try again."
+            else
+                echo "[-] Unexpected error: $REG_OUTPUT"
+            fi
+            exit 1
+        fi
+
+        echo "[+] Cloudflare WARP account registered successfully."
+    else
+        echo "[+] Existing wgcf-account.toml found. Skipping registration."
     fi
 
     echo "[*] Generating base WireGuard profile..."
-    "$WGCF_BIN" generate >/dev/null 2>&1
+    set +e
+    GEN_OUTPUT=$("$WGCF_BIN" generate 2>&1)
+    GEN_EXIT=$?
+    set -e
 
     if [ ! -f "$PROFILE_FILE" ]; then
-        echo "[-] Profile generation failed: $PROFILE_FILE missing."
+        echo "[-] wgcf generate ran but wgcf-profile.conf was not created."
+        echo "    The account file may be corrupt or revoked."
+        echo "    Delete wgcf-account.toml and run again."
+        [ -n "$GEN_OUTPUT" ] && echo "    Raw error: $GEN_OUTPUT"
         exit 1
     fi
 
@@ -112,10 +255,20 @@ register_account() {
     ADDRESS=$(grep "Address" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
     DNS=$(grep "DNS" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
     PUBLIC_KEY=$(grep "PublicKey" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
-    RESERVED=$(grep "Reserved" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ' || true)
+    RESERVED=$(grep "Reserved" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ' 2>/dev/null || true)
 
-    echo "[+] Base profile parameters extracted successfully."
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$ADDRESS" ]; then
+        echo "[-] Profile file created but is missing required keys. It may be corrupt."
+        echo "    Delete both wgcf-account.toml and wgcf-profile.conf and run again."
+        exit 1
+    fi
+
+    echo "[+] Profile parameters extracted successfully."
+    echo "    Address   : $ADDRESS"
+    echo "    PublicKey : $PUBLIC_KEY"
 }
+
+
 
 prescan_targets() {
     echo ""
@@ -309,6 +462,7 @@ main() {
         *) MAX_TESTS=30 ;;
     esac
 
+    pre_check
     check_prerequisites
     register_account
     prescan_targets

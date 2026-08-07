@@ -52,6 +52,136 @@ def is_admin():
         return False
 
 
+def test_tcp_reachable(host, port, timeout=5):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def read_wgcf_profile(path):
+    try:
+        content = Path(path).read_text(encoding="utf-8")
+        pk  = re.search(r"PrivateKey\s*=\s*(.+)", content)
+        ad  = re.search(r"Address\s*=\s*(.+)", content)
+        dn  = re.search(r"DNS\s*=\s*(.+)", content)
+        pub = re.search(r"PublicKey\s*=\s*(.+)", content)
+        res = re.search(r"Reserved\s*=\s*(.+)", content)
+        if not pk or not ad or not pub:
+            return None
+        return {
+            "PrivateKey": pk.group(1).strip(),
+            "Address":    ad.group(1).strip(),
+            "DNS":        dn.group(1).strip() if dn else "1.1.1.1",
+            "PublicKey":  pub.group(1).strip(),
+            "Reserved":   res.group(1).strip() if res else None
+        }
+    except Exception:
+        return None
+
+
+def pre_check():
+    print("\n======================================================================")
+    print("  Step 0: Environment Pre-Check")
+    print("======================================================================")
+
+    all_passed = True
+
+    # Check 0.1: Active wg-quick / WireGuard tunnel interfaces
+    print("[*] Checking for active WireGuard tunnel interfaces...")
+    try:
+        if IS_WINDOWS:
+            import subprocess as _sp
+            result = _sp.run(["sc", "query", "type=", "all"], capture_output=True, text=True, timeout=5)
+            tunnels = [l.strip() for l in result.stdout.splitlines() if "WireGuardTunnel$" in l]
+            if tunnels:
+                print("  [WARN] Active WireGuard tunnel services found:")
+                for t in tunnels:
+                    print(f"         {t}")
+                print("         These will interfere with tunnel testing in Step 5.")
+                choice = input("  Press Enter to continue anyway or type STOP to exit: ").strip().upper()
+                if choice == "STOP":
+                    sys.exit(1)
+            else:
+                print("  [PASS] No active WireGuard tunnel services detected.")
+        else:
+            import subprocess as _sp
+            result = _sp.run(["ip", "link", "show"], capture_output=True, text=True, timeout=5)
+            wg_ifaces = [l for l in result.stdout.splitlines() if "warp_" in l or "wg" in l]
+            if wg_ifaces:
+                print("  [WARN] Active WireGuard interfaces detected. They may interfere with scanning.")
+                input("  Press Enter to continue anyway or Ctrl+C to exit first: ")
+            else:
+                print("  [PASS] No active WireGuard interfaces detected.")
+    except Exception as e:
+        print(f"  [WARN] Could not check WireGuard tunnel status: {e}")
+
+    # Check 0.2: Cloudflare WARP app process
+    print("[*] Checking for Cloudflare WARP app process...")
+    try:
+        import subprocess as _sp
+        if IS_WINDOWS:
+            result = _sp.run(["tasklist"], capture_output=True, text=True, timeout=5)
+            if "warp-svc" in result.stdout.lower() or "cloudflare warp" in result.stdout.lower():
+                print("  [WARN] Cloudflare WARP app is running. Disconnect it before scanning.")
+                input("  Press Enter to continue anyway or Ctrl+C to exit and disconnect WARP: ")
+            else:
+                print("  [PASS] No Cloudflare WARP app process detected.")
+        else:
+            result = _sp.run(["pgrep", "-x", "warp-svc"], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                print("  [WARN] Cloudflare WARP service (warp-svc) is running.")
+                input("  Press Enter to continue anyway or Ctrl+C to exit: ")
+            else:
+                print("  [PASS] No Cloudflare WARP process detected.")
+    except Exception as e:
+        print(f"  [WARN] Could not check WARP process status: {e}")
+
+    # Check 0.3: Internet connectivity via ping
+    print("[*] Checking basic internet connectivity (ping 1.1.1.1)...")
+    try:
+        import subprocess as _sp
+        cmd = ["ping", "-n" if IS_WINDOWS else "-c", "1",
+               "-w" if IS_WINDOWS else "-W", "3000" if IS_WINDOWS else "3",
+               "1.1.1.1"]
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=6)
+        if result.returncode == 0:
+            print("  [PASS] Internet is reachable. Ping 1.1.1.1 succeeded.")
+        else:
+            print("  [WARN] Ping to 1.1.1.1 failed. ICMP may be blocked on your network.")
+            print("         Scan will still attempt UDP socket probes.")
+    except Exception as e:
+        print(f"  [WARN] Ping test error: {e}")
+
+    # Check 0.4: DNS resolution
+    print("[*] Checking DNS resolution (resolving cloudflare.com)...")
+    try:
+        addrs = socket.getaddrinfo("cloudflare.com", 443)
+        if addrs:
+            ip = addrs[0][4][0]
+            print(f"  [PASS] DNS working. cloudflare.com resolved to {ip}.")
+        else:
+            print("  [FAIL] DNS returned no results for cloudflare.com.")
+            all_passed = False
+    except Exception as e:
+        print(f"  [FAIL] DNS resolution failed: {e}")
+        print("         Your internet may not be working or DNS is blocked.")
+        all_passed = False
+
+    print()
+    if all_passed:
+        print("[+] Pre-check complete. All critical checks passed. Proceeding with scan.")
+    else:
+        print("[!] Pre-check complete. One or more checks failed. Scan may not produce results.")
+        choice = input("  Type YES to proceed anyway or press Enter to exit: ").strip().upper()
+        if choice != "YES":
+            sys.exit(1)
+
+
 def check_prerequisites():
     print("\n======================================================================")
     print("  Step 1: Prerequisite & Environment Checks")
@@ -133,39 +263,98 @@ def register_account():
     account_file = WORKING_DIR / "wgcf-account.toml"
     profile_file = WORKING_DIR / "wgcf-profile.conf"
 
-    if not account_file.exists():
-        print("[*] Registering new Cloudflare WARP account via wgcf...")
-        subprocess.run([str(WGCF_BIN), "register", "--accept-tos"], cwd=WORKING_DIR, check=True)
-    else:
-        print("[+] Existing Cloudflare WARP account detected.")
+    # Fast path: reuse existing valid profile
+    existing = read_wgcf_profile(profile_file)
+    if existing:
+        print("[+] Existing valid wgcf-profile.conf found. Skipping registration.")
+        return existing
 
-    print("[*] Generating WireGuard profile...")
-    subprocess.run([str(WGCF_BIN), "generate"], cwd=WORKING_DIR, check=True)
+    # Pre-check API reachability before running wgcf
+    if not account_file.exists():
+        print("[*] Checking reachability of api.cloudflareclient.com...")
+        if not test_tcp_reachable("api.cloudflareclient.com", 443, timeout=5):
+            print("")
+            print("[!] Cannot reach api.cloudflareclient.com on port 443.")
+            print("    Your network is blocking Cloudflare's WARP registration server.")
+            print("")
+            print("    Option A: Switch to mobile hotspot, run the script there once,")
+            print("              then copy wgcf-account.toml back here and run again.")
+            print("    Option B: Ask someone on an open network to run wgcf register")
+            print("              and send you their wgcf-account.toml file.")
+            print("    Option C: Place an existing wgcf-profile.conf here and run again.")
+            print("")
+            choice = input("  Press Enter to exit, or type SKIP to try anyway: ").strip().upper()
+            if choice != "SKIP":
+                sys.exit(1)
+            print("[!] Skipping pre-check. Attempting registration anyway...")
+        else:
+            print("[+] api.cloudflareclient.com is reachable. Proceeding with registration.")
+
+        print("[*] Registering new Cloudflare WARP account via wgcf...")
+        try:
+            result = subprocess.run(
+                [str(WGCF_BIN), "register", "--accept-tos"],
+                cwd=WORKING_DIR, capture_output=True, text=True, timeout=25
+            )
+            if result.returncode != 0:
+                combined = result.stdout + result.stderr
+                print("")
+                print("[-] Registration failed. Diagnosing...")
+                if any(k in combined for k in ["refused", "connectex", "actively refused", "No connection"]):
+                    print("[-] Connection actively refused by ISP or network firewall.")
+                    print("    The /reg API path is being specifically blocked.")
+                    print("    Switch to mobile hotspot, or obtain wgcf-account.toml from another network.")
+                elif any(k in combined for k in ["timeout", "timed out", "deadline"]):
+                    print("[-] Connection timed out waiting for Cloudflare's server.")
+                    print("    Try again in a few minutes or switch to mobile hotspot.")
+                elif any(k in combined for k in ["TLS", "certificate", "x509", "ssl", "handshake"]):
+                    print("[-] TLS handshake failed. A proxy or firewall is intercepting HTTPS.")
+                    print("    Try disabling antivirus SSL scanning or switch to mobile hotspot.")
+                elif any(k in combined for k in ["429", "rate limit", "too many"]):
+                    print("[-] Cloudflare rate-limited this registration attempt.")
+                    print("    Wait 10 to 15 minutes and try again.")
+                else:
+                    print(f"[-] Unexpected error: {combined.strip()}")
+                sys.exit(1)
+        except subprocess.TimeoutExpired:
+            print("[-] Registration timed out after 25 seconds.")
+            print("    The network may be throttling the connection. Try on mobile hotspot.")
+            sys.exit(1)
+
+        print("[+] Cloudflare WARP account registered successfully.")
+    else:
+        print("[+] Existing wgcf-account.toml found. Skipping registration.")
+
+    # Generate profile
+    print("[*] Generating WireGuard profile via wgcf...")
+    try:
+        result = subprocess.run(
+            [str(WGCF_BIN), "generate"],
+            cwd=WORKING_DIR, capture_output=True, text=True, timeout=15
+        )
+    except subprocess.TimeoutExpired:
+        print("[-] Profile generation timed out.")
+        print("    Delete wgcf-account.toml and run again to start fresh.")
+        sys.exit(1)
 
     if not profile_file.exists():
-        print(f"[-] Profile generation failed: {profile_file} missing.")
+        print("[-] wgcf generate ran but wgcf-profile.conf was not created.")
+        print("    The account file may be corrupt or revoked.")
+        print("    Delete wgcf-account.toml and run again.")
+        if result.stderr:
+            print(f"    Raw error: {result.stderr.strip()}")
         sys.exit(1)
 
-    content = profile_file.read_text(encoding="utf-8")
-    priv_match = re.search(r"PrivateKey\s*=\s*(.+)", content)
-    addr_match = re.search(r"Address\s*=\s*(.+)", content)
-    dns_match  = re.search(r"DNS\s*=\s*(.+)", content)
-    pub_match  = re.search(r"PublicKey\s*=\s*(.+)", content)
-    res_match  = re.search(r"Reserved\s*=\s*(.+)", content)
-
-    if not priv_match or not addr_match or not pub_match:
-        print("[-] Failed to parse required WireGuard keys from generated profile.")
+    profile = read_wgcf_profile(profile_file)
+    if not profile:
+        print("[-] Profile file created but is missing required keys. It may be corrupt.")
+        print("    Delete both wgcf-account.toml and wgcf-profile.conf and run again.")
         sys.exit(1)
 
-    profile_data = {
-        "PrivateKey": priv_match.group(1).strip(),
-        "Address": addr_match.group(1).strip(),
-        "DNS": dns_match.group(1).strip() if dns_match else "1.1.1.1",
-        "PublicKey": pub_match.group(1).strip(),
-        "Reserved": res_match.group(1).strip() if res_match else None
-    }
-    print("[+] Base profile parameters parsed successfully.")
-    return profile_data
+    print("[+] Profile generated and parsed successfully.")
+    print(f"    Address   : {profile['Address']}")
+    print(f"    PublicKey : {profile['PublicKey']}")
+    return profile
 
 
 def probe_endpoint(ip, port, timeout=0.8):
@@ -397,6 +586,7 @@ def main():
         elif choice == "4":
             sys.exit(0)
 
+    pre_check()
     check_prerequisites()
     profile = register_account()
     responsive = prescan_targets(threads=threads)

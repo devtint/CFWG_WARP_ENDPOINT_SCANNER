@@ -95,8 +95,7 @@ def pre_check():
     print("[*] Checking for active WireGuard tunnel interfaces...")
     try:
         if IS_WINDOWS:
-            import subprocess as _sp
-            result = _sp.run(["sc", "query", "type=", "all"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["sc", "query", "type=", "all"], capture_output=True, text=True, timeout=5)
             tunnels = [l.strip() for l in result.stdout.splitlines() if "WireGuardTunnel$" in l]
             if tunnels:
                 print("  [WARN] Active WireGuard tunnel services found:")
@@ -109,8 +108,7 @@ def pre_check():
             else:
                 print("  [PASS] No active WireGuard tunnel services detected.")
         else:
-            import subprocess as _sp
-            result = _sp.run(["ip", "link", "show"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["ip", "link", "show"], capture_output=True, text=True, timeout=5)
             wg_ifaces = [l for l in result.stdout.splitlines() if "warp_" in l or "wg" in l]
             if wg_ifaces:
                 print("  [WARN] Active WireGuard interfaces detected. They may interfere with scanning.")
@@ -123,16 +121,15 @@ def pre_check():
     # Check 0.2: Cloudflare WARP app process
     print("[*] Checking for Cloudflare WARP app process...")
     try:
-        import subprocess as _sp
         if IS_WINDOWS:
-            result = _sp.run(["tasklist"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=5)
             if "warp-svc" in result.stdout.lower() or "cloudflare warp" in result.stdout.lower():
                 print("  [WARN] Cloudflare WARP app is running. Disconnect it before scanning.")
                 input("  Press Enter to continue anyway or Ctrl+C to exit and disconnect WARP: ")
             else:
                 print("  [PASS] No Cloudflare WARP app process detected.")
         else:
-            result = _sp.run(["pgrep", "-x", "warp-svc"], capture_output=True, timeout=5)
+            result = subprocess.run(["pgrep", "-x", "warp-svc"], capture_output=True, timeout=5)
             if result.returncode == 0:
                 print("  [WARN] Cloudflare WARP service (warp-svc) is running.")
                 input("  Press Enter to continue anyway or Ctrl+C to exit: ")
@@ -144,11 +141,10 @@ def pre_check():
     # Check 0.3: Internet connectivity via ping
     print("[*] Checking basic internet connectivity (ping 1.1.1.1)...")
     try:
-        import subprocess as _sp
         cmd = ["ping", "-n" if IS_WINDOWS else "-c", "1",
                "-w" if IS_WINDOWS else "-W", "3000" if IS_WINDOWS else "3",
                "1.1.1.1"]
-        result = _sp.run(cmd, capture_output=True, text=True, timeout=6)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
         if result.returncode == 0:
             print("  [PASS] Internet is reachable. Ping 1.1.1.1 succeeded.")
         else:
@@ -214,7 +210,7 @@ def download_wgcf():
     api_url = "https://api.github.com/repos/ViRb3/wgcf/releases/latest"
     req = urllib.request.Request(api_url, headers={"User-Agent": "WARP-Scanner-Python"})
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         arch = "amd64"

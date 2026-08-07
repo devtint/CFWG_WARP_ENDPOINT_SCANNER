@@ -231,9 +231,13 @@ if ($activeTunnels) {
     Write-Host ""
     $killChoice = Read-Host "  Type STOP to remove them now, or press Enter to continue anyway"
     if ($killChoice.Trim().ToUpper() -eq "STOP") {
+        # Resolve WireGuard path early for cleanup
+        $earlyWgPath = $WIREGUARD_PATH
+        $cmdWgEarly = Get-Command "wireguard.exe" -ErrorAction SilentlyContinue
+        if ($cmdWgEarly) { $earlyWgPath = $cmdWgEarly.Source }
         foreach ($t in $activeTunnels) {
             $tName = $t.ServiceName.Replace("WireGuardTunnel$", "")
-            Remove-WarpTunnelService -TunnelName $tName -WireGuardExePath $WIREGUARD_PATH
+            Remove-WarpTunnelService -TunnelName $tName -WireGuardExePath $earlyWgPath
         }
         Write-Success "Active tunnels removed. Continuing."
     } else {
@@ -473,11 +477,11 @@ try {
             $pinfo.RedirectStandardOutput = $true
             $pinfo.RedirectStandardError  = $true
 
-            $proc             = [System.Diagnostics.Process]::Start($pinfo)
+            $proc   = [System.Diagnostics.Process]::Start($pinfo)
+            $stdOut = $proc.StandardOutput.ReadToEnd()
+            $stdErr = $proc.StandardError.ReadToEnd()
             $registerFinished = $proc.WaitForExit(25000)
-            $stdOut           = $proc.StandardOutput.ReadToEnd()
-            $stdErr           = $proc.StandardError.ReadToEnd()
-            $combined         = "$stdOut $stdErr"
+            $combined = "$stdOut $stdErr"
 
             if (-not $registerFinished) {
                 try { $proc.Kill() } catch {}

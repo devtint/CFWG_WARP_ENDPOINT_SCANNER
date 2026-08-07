@@ -327,7 +327,9 @@ generate_configs() {
     echo "  Step 4: Batch Configuration File Generation"
     echo "======================================================================"
 
+    # Clear old candidate configs from previous runs (only .conf files, not the folder itself)
     mkdir -p "$CONFIG_DIR"
+    rm -f "${CONFIG_DIR}"/*.conf
     mkdir -p "$WORKING_CONF_DIR"
 
     MAX_TESTS=${1:-30}

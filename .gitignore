@@ -1,0 +1,35 @@
+# WireGuard Executable & Generated Binaries
+wgcf
+wgcf.exe
+
+# Generated Account & Base Profile Files
+wgcf-account.toml
+wgcf-profile.conf
+
+# Generated Configuration Directories
+WARP_Configs/
+Working_Configs/
+
+# Output Scan Summary Reports
+working_endpoints.csv
+working_endpoints.txt
+
+# Temporary Scan Directories & Artifacts
+.tmp_scan/
+*.tmp
+*.log
+
+# Python Cache & Bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# System Specific Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor Files
+.vscode/
+.idea/
+*.swp

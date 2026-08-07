@@ -1,0 +1,749 @@
+<#
+.SYNOPSIS
+    Cloudflare WARP Mass Endpoint Scanner & WireGuard Tunnel Validator for Windows.
+.DESCRIPTION
+    A comprehensive, high-performance PowerShell script (v5.1/v7+) that automatically:
+      1. Verifies Administrator execution rights and prerequisite binaries (wireguard.exe, wgcf.exe).
+      2. Downloads wgcf.exe from GitHub if missing.
+      3. Registers a Cloudflare WARP account & generates base profile via wgcf.
+      4. Expands Cloudflare IP subnets & ports and performs a fast multi-threaded pre-scan using RunspacePool.
+      5. Generates batch WireGuard .conf profiles for responsive endpoints.
+      6. Tests active WireGuard tunnel connectivity, 1.1.1.1 ping, and cloudflare.com/cdn-cgi/trace verification.
+      7. Exports top-performing working endpoints to CSV and TXT files sorted by latency.
+.PARAMETER PreScanThreads
+    Number of concurrent threads for UDP/ICMP pre-scanning (Default: 100).
+.PARAMETER PreScanTimeoutMs
+    Socket timeout in milliseconds for pre-scan reachability check (Default: 800ms).
+.PARAMETER MaxTunnelTests
+    Maximum number of top pre-scanned endpoints to test full WireGuard tunnels on (Default: 30).
+.PARAMETER TunnelWaitSec
+    Handshake wait time in seconds after installing tunnel service (Default: 4).
+.PARAMETER CleanUpOnly
+    Switch parameter to cleanly remove any leftover WireGuard tunnel services created by this script.
+.EXAMPLE
+    .\WARP-Scanner.ps1
+.EXAMPLE
+    .\WARP-Scanner.ps1 -PreScanThreads 150 -MaxTunnelTests 50
+.EXAMPLE
+    .\WARP-Scanner.ps1 -CleanUpOnly
+#>
+
+[CmdletBinding()]
+param (
+    [int]$PreScanThreads = 100,
+    [int]$PreScanTimeoutMs = 800,
+    [int]$MaxTunnelTests = 30,
+    [int]$TunnelWaitSec = 4,
+    [switch]$CleanUpOnly
+)
+
+# -----------------------------------------------------------------------------
+# GLOBAL CONSTANTS & CONFIGURATION
+# -----------------------------------------------------------------------------
+$ErrorActionPreference = "Stop"
+
+$CLOUDFLARE_SUBNETS = @(
+    "162.159.192.0/24",
+    "162.159.193.0/24",
+    "162.159.195.0/24",
+    "188.114.96.0/24",
+    "188.114.97.0/24",
+    "188.114.98.0/24"
+)
+
+$WARP_PORTS = @(2408, 500, 4500, 1701, 854, 859, 864, 939)
+
+$WORKING_DIR      = $PSScriptRoot
+if (-not $WORKING_DIR) { $WORKING_DIR = Get-Location }
+
+$CONFIG_DIR       = Join-Path $WORKING_DIR "WARP_Configs"
+$SUCCESS_CONF_DIR = Join-Path $WORKING_DIR "Working_Configs"
+$WGCF_EXE         = Join-Path $WORKING_DIR "wgcf.exe"
+$WIREGUARD_PATH   = "C:\Program Files\WireGuard\wireguard.exe"
+
+$CSV_OUTPUT_PATH  = Join-Path $WORKING_DIR "working_endpoints.csv"
+$TXT_OUTPUT_PATH  = Join-Path $WORKING_DIR "working_endpoints.txt"
+
+$script:ActiveTunnelName = $null
+
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS & LOGGING
+# -----------------------------------------------------------------------------
+function Write-Header {
+    param([string]$Message)
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host "  $Message" -ForegroundColor Cyan
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+}
+
+function Write-Info {
+    param([string]$Message)
+    Write-Host "[*] $Message" -ForegroundColor Cyan
+}
+
+function Write-Success {
+    param([string]$Message)
+    Write-Host "[+] $Message" -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([string]$Message)
+    Write-Host "[!] $Message" -ForegroundColor Yellow
+}
+
+function Write-Err {
+    param([string]$Message)
+    Write-Host "[-] $Message" -ForegroundColor Red
+}
+
+# Cleanup leftover tunnel services
+function Remove-WarpTunnelService {
+    param(
+        [string]$TunnelName,
+        [string]$WireGuardExePath
+    )
+
+    if (-not $TunnelName) { return }
+
+    Write-Info "Uninstalling tunnel service: '$TunnelName'..."
+    try {
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = $WireGuardExePath
+        $pinfo.Arguments = "/uninstalltunnelservice `"$TunnelName`""
+        $pinfo.UseShellExecute = $false
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+        $pinfo.CreateNoWindow = $true
+
+        $process = [System.Diagnostics.Process]::Start($pinfo)
+        $finished = $process.WaitForExit(8000)
+
+        if (-not $finished) {
+            Write-Warn "Tunnel service uninstall command timed out. Killing process..."
+            try { $process.Kill() } catch {}
+        }
+    } catch {
+        Write-Warn "Error removing tunnel service '$TunnelName': $_"
+    } finally {
+        $script:ActiveTunnelName = $null
+    }
+}
+
+# Global Exit / Interruption Handler
+function Cleanup-All {
+    if ($script:ActiveTunnelName) {
+        Write-Warn "Script interrupted. Cleaning up active tunnel: $script:ActiveTunnelName"
+        $wgExe = $script:ResolvedWgExe
+        if (-not $wgExe) { $wgExe = $WIREGUARD_PATH }
+        Remove-WarpTunnelService -TunnelName $script:ActiveTunnelName -WireGuardExePath $wgExe
+    }
+}
+
+# Register CancelKeyPress trap
+try {
+    [Console]::TreatControlCAsInput = $false
+    Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action { Cleanup-All } | Out-Null
+} catch {}
+
+# -----------------------------------------------------------------------------
+# INTERACTIVE SELECTION MENU (When run without explicit switches)
+# -----------------------------------------------------------------------------
+if ($PSBoundParameters.Count -eq 0) {
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host "  Cloudflare WARP Scanner by Tint Naing Win (@BadCodeWriter)" -ForegroundColor Cyan
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+    Write-Host "  Select Scanning Mode:" -ForegroundColor White
+    Write-Host "    [1] Standard Scan  (100 Threads, 30 Candidate Tunnel Tests)" -ForegroundColor Green
+    Write-Host "    [2] Fast Scan      (150 Threads, 15 Candidate Tunnel Tests)" -ForegroundColor Yellow
+    Write-Host "    [3] Deep Scan      (100 Threads, 60 Candidate Tunnel Tests)" -ForegroundColor Magenta
+    Write-Host "    [4] Cleanup        (Remove leftover WireGuard tunnel services)" -ForegroundColor Cyan
+    Write-Host "    [5] Exit" -ForegroundColor Red
+    Write-Host ""
+    
+    $userChoice = Read-Host "  Enter choice [1-5] (Default is 1)"
+    if (-not $userChoice) { $userChoice = "1" }
+
+    switch ($userChoice.Trim()) {
+        "2" {
+            $PreScanThreads = 150
+            $MaxTunnelTests = 15
+        }
+        "3" {
+            $PreScanThreads = 100
+            $MaxTunnelTests = 60
+        }
+        "4" {
+            $CleanUpOnly = $true
+        }
+        "5" {
+            Write-Host "  Exiting scanner script." -ForegroundColor Yellow
+            exit 0
+        }
+        default {
+            $PreScanThreads = 100
+            $MaxTunnelTests = 30
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# CLEANUP ONLY MODE
+# -----------------------------------------------------------------------------
+if ($CleanUpOnly) {
+    Write-Header "WireGuard Cleanup Mode"
+    $services = Get-Service -Name "WireGuardTunnel$*" -ErrorAction SilentlyContinue
+    if ($services) {
+        foreach ($svc in $services) {
+            $tName = $svc.ServiceName.Replace("WireGuardTunnel$", "")
+            Write-Warn "Found active leftover service: $($svc.ServiceName). Removing..."
+            Remove-WarpTunnelService -TunnelName $tName -WireGuardExePath $WIREGUARD_PATH
+        }
+        Write-Success "All WireGuard tunnel services cleaned up."
+    } else {
+        Write-Info "No active WireGuard tunnel services found."
+    }
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# STEP 1: PREREQUISITE & ENVIRONMENT CHECKS
+# -----------------------------------------------------------------------------
+try {
+    Write-Header "Step 1: Prerequisite & Environment Checks"
+
+    # 1.1 Admin Privileges Check
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    $isAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if (-not $isAdmin) {
+        Write-Err "ADMINISTRATOR PRIVILEGES REQUIRED!"
+        Write-Warn "This script installs/uninstalls temporary WireGuard tunnel services."
+        Write-Warn "Please restart PowerShell as Administrator and run the script again."
+        exit 1
+    }
+    Write-Success "Administrator privileges confirmed."
+
+    # 1.2 WireGuard Executable Check
+    $wgExePath = $WIREGUARD_PATH
+    if (-not (Test-Path $wgExePath)) {
+        $cmdWg = Get-Command "wireguard.exe" -ErrorAction SilentlyContinue
+        if ($cmdWg) {
+            $wgExePath = $cmdWg.Source
+        } else {
+            Write-Err "WireGuard executable NOT found at '$WIREGUARD_PATH' or system PATH!"
+            Write-Warn "Please install WireGuard for Windows from: https://www.wireguard.com/install/"
+            exit 1
+        }
+    }
+    $script:ResolvedWgExe = $wgExePath
+    Write-Success "WireGuard binary verified: $wgExePath"
+
+    # 1.3 wgcf.exe Check & Automatic Download
+    if (-not (Test-Path $WGCF_EXE)) {
+        Write-Warn "wgcf.exe not found in working directory ($WORKING_DIR)."
+        Write-Info "Attempting to auto-download latest wgcf release from GitHub..."
+
+        # Enable TLS 1.2 / 1.3
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+
+        $githubApiUrl = "https://api.github.com/repos/ViRb3/wgcf/releases/latest"
+        $headers = @{ "User-Agent" = "PowerShell-WARP-Scanner" }
+        $release = Invoke-RestMethod -Uri $githubApiUrl -Headers $headers -ErrorAction Stop
+
+        $arch = "amd64"
+        if ($env:PROCESSOR_ARCHITECTURE -match "ARM64") {
+            $arch = "arm64"
+        } elseif ($env:PROCESSOR_ARCHITECTURE -match "x86") {
+            $arch = "386"
+        }
+
+        $asset = $release.assets | Where-Object { $_.name -like "*windows*$arch*.exe" } | Select-Object -First 1
+
+        if (-not $asset) {
+            # Fallback to any windows exe
+            $asset = $release.assets | Where-Object { $_.name -like "*windows*.exe" } | Select-Object -First 1
+        }
+
+        if (-not $asset) {
+            throw "Failed to locate a compatible Windows release binary for wgcf on GitHub."
+        }
+
+        Write-Info "Downloading '$($asset.name)' from $($asset.browser_download_url)..."
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $WGCF_EXE -UseBasicParsing
+        Write-Success "wgcf.exe downloaded successfully to $WGCF_EXE"
+    } else {
+        Write-Success "wgcf.exe verified in working directory."
+    }
+
+} catch {
+    Write-Err "Prerequisite check failed: $_"
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 2: CLOUDFLARE ACCOUNT REGISTRATION & PROFILE PARSING
+# -----------------------------------------------------------------------------
+try {
+    Write-Header "Step 2: Cloudflare Account Registration & Key Extraction"
+
+    $accountFile = Join-Path $WORKING_DIR "wgcf-account.toml"
+    $profileFile = Join-Path $WORKING_DIR "wgcf-profile.conf"
+
+    # Register if account doesn't exist
+    if (-not (Test-Path $accountFile)) {
+        Write-Info "Registering new Cloudflare WARP account via wgcf..."
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = $WGCF_EXE
+        $pinfo.Arguments = "register --accept-tos"
+        $pinfo.WorkingDirectory = $WORKING_DIR
+        $pinfo.UseShellExecute = $false
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+
+        $proc = [System.Diagnostics.Process]::Start($pinfo)
+        $proc.WaitForExit(15000)
+        
+        if ($proc.ExitCode -ne 0) {
+            $errOut = $proc.StandardError.ReadToEnd()
+            Write-Warn "wgcf register warning/output: $errOut"
+        }
+    } else {
+        Write-Success "Existing Cloudflare WARP account file detected."
+    }
+
+    # Generate profile
+    Write-Info "Generating WireGuard profile via wgcf..."
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = $WGCF_EXE
+    $pinfo.Arguments = "generate"
+    $pinfo.WorkingDirectory = $WORKING_DIR
+    $pinfo.UseShellExecute = $false
+    $pinfo.RedirectStandardOutput = $true
+    $pinfo.RedirectStandardError = $true
+
+    $proc = [System.Diagnostics.Process]::Start($pinfo)
+    $proc.WaitForExit(15000)
+
+    if (-not (Test-Path $profileFile)) {
+        throw "Failed to generate '$profileFile'. Check wgcf installation."
+    }
+    Write-Success "Base profile generated: $profileFile"
+
+    # Parse profile configuration
+    $confContent = Get-Content -Path $profileFile -Raw
+
+    $privateKey = if ($confContent -match "PrivateKey\s*=\s*(.+)") { $matches[1].Trim() } else { $null }
+    $address    = if ($confContent -match "Address\s*=\s*(.+)")    { $matches[1].Trim() } else { $null }
+    $dns        = if ($confContent -match "DNS\s*=\s*(.+)")        { $matches[1].Trim() } else { $null }
+    $publicKey  = if ($confContent -match "PublicKey\s*=\s*(.+)")  { $matches[1].Trim() } else { $null }
+    $reserved   = if ($confContent -match "Reserved\s*=\s*(.+)")   { $matches[1].Trim() } else { $null }
+
+    if (-not $privateKey -or -not $publicKey -or -not $address) {
+        throw "Could not parse PrivateKey, PublicKey, or Address from $profileFile."
+    }
+
+    Write-Success "Profile parameters extracted:"
+    Write-Host "   - Address    : $address" -ForegroundColor Gray
+    Write-Host "   - DNS        : $dns" -ForegroundColor Gray
+    Write-Host "   - PublicKey  : $publicKey" -ForegroundColor Gray
+    if ($reserved) {
+        Write-Host "   - Reserved   : $reserved" -ForegroundColor Gray
+    }
+
+} catch {
+    Write-Err "Account registration / Profile parsing failed: $_"
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 3: MASS ENDPOINT GENERATION & RUNSPACE PRE-SCAN
+# -----------------------------------------------------------------------------
+try {
+    Write-Header "Step 3: Mass Target Generation & Fast Multithreaded Pre-Scan"
+
+    # 3.1 Subnet Expansion
+    $targetCandidates = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($subnet in $CLOUDFLARE_SUBNETS) {
+        $parts = $subnet.Split('/')
+        $baseIp = $parts[0]
+        $mask   = [int]$parts[1]
+
+        if ($mask -eq 24) {
+            $octets = $baseIp.Split('.')
+            $prefix = "$($octets[0]).$($octets[1]).$($octets[2])"
+            
+            # Scan host IPs .1 to .254
+            for ($i = 1; $i -le 254; $i++) {
+                $ip = "$prefix.$i"
+                foreach ($port in $WARP_PORTS) {
+                    $targetCandidates.Add([PSCustomObject]@{
+                        IP       = $ip
+                        Port     = $port
+                        Endpoint = "$ip`:$port"
+                    })
+                }
+            }
+        }
+    }
+
+    $totalCandidates = $targetCandidates.Count
+    Write-Info "Generated $totalCandidates candidate IP:Port combinations from Cloudflare ranges."
+    Write-Info "Starting fast multi-threaded pre-scan (Threads: $PreScanThreads, Timeout: ${PreScanTimeoutMs}ms)..."
+
+    # 3.2 RunspacePool Multithreaded Scanner
+    $iss = [initialsessionstate]::CreateDefault()
+    $pool = [runspacefactory]::CreateRunspacePool(1, $PreScanThreads, $iss, $Host)
+    $pool.Open()
+
+    $scriptBlock = {
+        param($ip, $port, $timeoutMs)
+
+        $result = [PSCustomObject]@{
+            IP         = $ip
+            Port       = $port
+            Endpoint   = "$ip`:$port"
+            Reachable  = $false
+            LatencyMs  = 9999
+        }
+
+        # 1. Fast UDP Socket Probe
+        try {
+            $udpClient = New-Object System.Net.Sockets.UdpClient
+            $udpClient.Client.ReceiveTimeout = $timeoutMs
+            $udpClient.Client.SendTimeout    = $timeoutMs
+
+            # Connect socket
+            $udpClient.Connect($ip, $port)
+
+            # Send a 32-byte probe payload (WireGuard handshake dummy or probe)
+            $probeBytes = [byte[]](0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00)
+            
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $udpClient.Send($probeBytes, $probeBytes.Length) | Out-Null
+            $sw.Stop()
+
+            $udpClient.Close()
+            $result.Reachable = $true
+            $result.LatencyMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+        } catch {
+            # Socket fallback check via ICMP Ping
+            try {
+                $ping = New-Object System.Net.NetworkInformation.Ping
+                $reply = $ping.Send($ip, $timeoutMs)
+                if ($reply.Status -eq 'Success') {
+                    $result.Reachable = $true
+                    $result.LatencyMs = $reply.RoundtripTime
+                }
+            } catch {}
+        }
+
+        return $result
+    }
+
+    $jobs = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($item in $targetCandidates) {
+        $powershell = [powershell]::Create().AddScript($scriptBlock).AddArgument($item.IP).AddArgument($item.Port).AddArgument($PreScanTimeoutMs)
+        $powershell.RunspacePool = $pool
+        $jobs.Add([PSCustomObject]@{
+            Pipe   = $powershell
+            Handle = $powershell.BeginInvoke()
+        })
+    }
+
+    # Collect Results with Progress Bar
+    $responsiveEndpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $completedCount = 0
+
+    while ($jobs.Count -gt 0) {
+        for ($i = $jobs.Count - 1; $i -ge 0; $i--) {
+            $job = $jobs[$i]
+            if ($job.Handle.IsCompleted) {
+                $res = $job.Pipe.EndInvoke($job.Handle)
+                $job.Pipe.Dispose()
+                $jobs.RemoveAt($i)
+
+                $completedCount++
+                if ($res -and $res.Reachable) {
+                    $responsiveEndpoints.Add($res[0])
+                }
+
+                if ($completedCount % 500 -eq 0 -or $completedCount -eq $totalCandidates) {
+                    $percent = [math]::Round(($completedCount / $totalCandidates) * 100, 1)
+                    Write-Progress -Activity "Pre-scanning Cloudflare WARP Endpoints" -Status "$completedCount / $totalCandidates ($percent%) completed | Found: $($responsiveEndpoints.Count)" -PercentComplete $percent
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+
+    $pool.Close()
+    $pool.Dispose()
+    Write-Progress -Activity "Pre-scanning Cloudflare WARP Endpoints" -Completed
+
+    Write-Success "Pre-scan complete! Found $($responsiveEndpoints.Count) responsive IP:Port candidates out of $totalCandidates scanned."
+
+    if ($responsiveEndpoints.Count -eq 0) {
+        Write-Warn "No endpoints responded to initial pre-scan probe."
+        Write-Warn "Selecting top candidate IP:Port combinations as fallback targets..."
+        # Fallback select first N candidates with default ports 2408, 500, 4500
+        $fallbackTargets = $targetCandidates | Where-Object { $_.Port -in @(2408, 500, 4500) } | Select-Object -First $MaxTunnelTests
+        foreach ($fb in $fallbackTargets) {
+            $responsiveEndpoints.Add([PSCustomObject]@{
+                IP        = $fb.IP
+                Port      = $fb.Port
+                Endpoint  = $fb.Endpoint
+                Reachable = $true
+                LatencyMs = 999
+            })
+        }
+    }
+
+} catch {
+    Write-Err "Pre-scan stage failed: $_"
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 4: BATCH CONFIGURATION GENERATION
+# -----------------------------------------------------------------------------
+try {
+    Write-Header "Step 4: Batch Configuration File Generation"
+
+    if (-not (Test-Path $CONFIG_DIR)) {
+        New-Item -ItemType Directory -Path $CONFIG_DIR -Force | Out-Null
+    }
+    if (-not (Test-Path $SUCCESS_CONF_DIR)) {
+        New-Item -ItemType Directory -Path $SUCCESS_CONF_DIR -Force | Out-Null
+    }
+
+    # Sort pre-scan endpoints by latency and select top candidate limit
+    $topCandidates = $responsiveEndpoints | Sort-Object LatencyMs | Select-Object -First $MaxTunnelTests
+
+    Write-Info "Generating WireGuard configuration files in '$CONFIG_DIR' for $($topCandidates.Count) top candidates..."
+
+    $generatedConfs = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($cand in $topCandidates) {
+        # Safe filename escaping for IP and Port
+        $safeIpName = $cand.IP -replace '\.', '_'
+        $confFileName = "warp_${safeIpName}_$($cand.Port).conf"
+        $confFilePath = Join-Path $CONFIG_DIR $confFileName
+
+        $reservedLine = if ($reserved) { "Reserved = $reserved`n" } else { "" }
+
+        $confText = @"
+[Interface]
+PrivateKey = $privateKey
+Address = $address
+DNS = $dns
+${reservedLine}
+[Peer]
+PublicKey = $publicKey
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $($cand.Endpoint)
+"@
+        Set-Content -Path $confFilePath -Value $confText -Encoding ASCII -Force
+
+        $generatedConfs.Add([PSCustomObject]@{
+            Endpoint     = $cand.Endpoint
+            IP           = $cand.IP
+            Port         = $cand.Port
+            ConfPath     = $confFilePath
+            ConfName     = [System.IO.Path]::GetFileNameWithoutExtension($confFileName)
+            InitLatency  = $cand.LatencyMs
+        })
+    }
+
+    Write-Success "Generated $($generatedConfs.Count) configuration files in $CONFIG_DIR."
+
+} catch {
+    Write-Err "Configuration file generation failed: $_"
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# STEP 5: AUTOMATED TUNNEL CONNECTION VERIFICATION LOOP
+# -----------------------------------------------------------------------------
+$verifiedEndpoints = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+try {
+    Write-Header "Step 5: Active WireGuard Tunnel Connectivity Testing"
+    Write-Info "Testing $($generatedConfs.Count) candidates with active tunnel service creation..."
+    Write-Info "Tunnel Wait Time: ${TunnelWaitSec}s per configuration."
+
+    $testIndex = 0
+    foreach ($item in $generatedConfs) {
+        $testIndex++
+        $tunnelName = $item.ConfName
+        $confPath   = $item.ConfPath
+        $endpoint   = $item.Endpoint
+
+        Write-Host ""
+        Write-Host "[$testIndex/$($generatedConfs.Count)] Testing Endpoint: $endpoint ($tunnelName)" -ForegroundColor Yellow
+
+        $script:ActiveTunnelName = $tunnelName
+
+        # 5.1 Install and Start WireGuard Tunnel Service
+        try {
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $script:ResolvedWgExe
+            $pinfo.Arguments = "/installtunnelservice `"$confPath`""
+            $pinfo.UseShellExecute = $false
+            $pinfo.RedirectStandardOutput = $true
+            $pinfo.RedirectStandardError = $true
+            $pinfo.CreateNoWindow = $true
+
+            $proc = [System.Diagnostics.Process]::Start($pinfo)
+            $finished = $proc.WaitForExit(10000)
+
+            if (-not $finished) {
+                Write-Warn "Tunnel service install timed out for $endpoint. Killing process..."
+                try { $proc.Kill() } catch {}
+                Remove-WarpTunnelService -TunnelName $tunnelName -WireGuardExePath $script:ResolvedWgExe
+                continue
+            }
+        } catch {
+            Write-Warn "Failed to launch tunnel service for $($endpoint): $_"
+            Remove-WarpTunnelService -TunnelName $tunnelName -WireGuardExePath $script:ResolvedWgExe
+            continue
+        }
+
+        # 5.2 Wait for Handshake & Interface Initialization
+        Write-Info "Waiting ${TunnelWaitSec}s for handshake completion..."
+        Start-Sleep -Seconds $TunnelWaitSec
+
+        # 5.3 Validation Checks
+        $pingSuccess = $false
+        $avgPingRtt  = 9999
+        $traceResult = "OFF"
+        $warpStatus  = "OFF"
+        $colo        = "N/A"
+
+        # Check 1: ICMP Ping to 1.1.1.1 through tunnel
+        try {
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            $rtts = @()
+            for ($p = 1; $p -le 3; $p++) {
+                $reply = $ping.Send("1.1.1.1", 2000)
+                if ($reply.Status -eq 'Success') {
+                    $rtts += $reply.RoundtripTime
+                }
+                Start-Sleep -Milliseconds 150
+            }
+
+            if ($rtts.Count -gt 0) {
+                $pingSuccess = $true
+                $avgPingRtt  = [math]::Round(($rtts | Measure-Object -Average).Average, 1)
+            }
+        } catch {}
+
+        # Check 2: HTTP Request to Cloudflare Trace Endpoint
+        if ($pingSuccess) {
+            try {
+                [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+                $req = [System.Net.HttpWebRequest]::Create("https://www.cloudflare.com/cdn-cgi/trace")
+                $req.Timeout = 3000
+                $req.ReadWriteTimeout = 3000
+                $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+
+                $resp = $req.GetResponse()
+                $stream = $resp.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $traceText = $reader.ReadToEnd()
+                $reader.Close()
+                $resp.Close()
+
+                if ($traceText -match "warp=(on|plus)") {
+                    $warpStatus = $matches[1]
+                }
+                if ($traceText -match "colo=([A-Z]+)") {
+                    $colo = $matches[1]
+                }
+            } catch {
+                Write-Warn "HTTP trace request check failed: $_"
+            }
+        }
+
+        # 5.4 Evaluate Tunnel Health
+        if ($pingSuccess -and ($warpStatus -eq "on" -or $warpStatus -eq "plus")) {
+            Write-Success "VALID WARP ENDPOINT FOUND!"
+            Write-Host "   - Endpoint   : $endpoint" -ForegroundColor Green
+            Write-Host "   - Ping 1.1.1.1: SUCCESS ($avgPingRtt ms)" -ForegroundColor Green
+            Write-Host "   - WARP Trace : $warpStatus (Colo: $colo)" -ForegroundColor Green
+
+            # Copy successful config to Working_Configs folder
+            $destWorkingConf = Join-Path $SUCCESS_CONF_DIR ([System.IO.Path]::GetFileName($confPath))
+            Copy-Item -Path $confPath -Destination $destWorkingConf -Force
+
+            $verifiedEndpoints.Add([PSCustomObject]@{
+                Endpoint   = $endpoint
+                IP         = $item.IP
+                Port       = $item.Port
+                LatencyMs  = $avgPingRtt
+                WarpStatus = $warpStatus
+                Location   = $colo
+                ConfigFile = [System.IO.Path]::GetFileName($confPath)
+            })
+        } else {
+            Write-Err "Tunnel validation failed for $endpoint (Ping: $pingSuccess, WARP Trace: $warpStatus)"
+        }
+
+        # 5.5 Uninstall Tunnel Service & Interface Cleanup Delay
+        Remove-WarpTunnelService -TunnelName $tunnelName -WireGuardExePath $script:ResolvedWgExe
+        Start-Sleep -Seconds 2
+    }
+
+} catch {
+    Write-Err "Tunnel verification loop interrupted: $_"
+} finally {
+    Cleanup-All
+}
+
+# -----------------------------------------------------------------------------
+# STEP 6: REPORTING, SORTING & OUTPUT EXPORT
+# -----------------------------------------------------------------------------
+Write-Header "Step 6: Results Summary & File Export"
+
+if ($verifiedEndpoints.Count -gt 0) {
+    # Sort endpoints by latency ascending
+    $sortedResults = $verifiedEndpoints | Sort-Object LatencyMs
+
+    Write-Success "Found $($sortedResults.Count) working Cloudflare WARP endpoints!"
+    Write-Host ""
+    Write-Host "Top Performing Endpoints:" -ForegroundColor Yellow
+    Write-Host ("{0,-22} {1,-12} {2,-12} {3,-10} {4,-25}" -f "Endpoint", "Latency (ms)", "WARP Status", "DataCenter", "Config File") -ForegroundColor Cyan
+    Write-Host ("-" * 82) -ForegroundColor Gray
+
+    foreach ($res in $sortedResults) {
+        Write-Host ("{0,-22} {1,-12} {2,-12} {3,-10} {4,-25}" -f $res.Endpoint, $res.LatencyMs, $res.WarpStatus, $res.Location, $res.ConfigFile) -ForegroundColor Green
+    }
+
+    # Export to CSV
+    $sortedResults | Export-Csv -Path $CSV_OUTPUT_PATH -NoTypeInformation -Encoding UTF8 -Force
+    Write-Success "Exported CSV summary to: $CSV_OUTPUT_PATH"
+
+    # Export to TXT
+    $txtLines = @(
+        "# Cloudflare WARP Working Endpoints - Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        "# Total Verified: $($sortedResults.Count)",
+        "#" + ("-" * 60)
+    )
+    foreach ($res in $sortedResults) {
+        $txtLines += "$($res.Endpoint) | Latency: $($res.LatencyMs) ms | WARP: $($res.WarpStatus) | Datacenter: $($res.Location) | Config: $($res.ConfigFile)"
+    }
+    Set-Content -Path $TXT_OUTPUT_PATH -Value $txtLines -Encoding UTF8 -Force
+    Write-Success "Exported TXT summary to: $TXT_OUTPUT_PATH"
+
+    Write-Success "Saved working WireGuard configuration files to: $SUCCESS_CONF_DIR"
+
+} else {
+    Write-Warn "No endpoints passed active tunnel verification."
+    Write-Info "You may try running the script again with a higher -PreScanTimeoutMs or check your network/firewall."
+}
+
+Write-Header "Execution Completed"

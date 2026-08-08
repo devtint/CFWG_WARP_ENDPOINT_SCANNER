@@ -190,9 +190,26 @@ check_prerequisites() {
     fi
 }
 
-# -----------------------------------------------------------------------------
-# STEP 2: CLOUDFLARE ACCOUNT REGISTRATION & PROFILE PARSING
-# -----------------------------------------------------------------------------
+get_warpgen_profile_cloud() {
+    echo "[*] Attempting automatic Cloud API fallback via WarpGen (https://warp-conf-gen.vercel.app)..."
+    CONF_JSON=$(curl -s -X POST --max-time 10 https://warp-conf-gen.vercel.app/api/generate 2>/dev/null || true)
+    if [ -n "$CONF_JSON" ]; then
+        CONF_TEXT=""
+        if command -v python3 >/dev/null 2>&1; then
+            CONF_TEXT=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('conf', ''))" <<< "$CONF_JSON" 2>/dev/null || true)
+        else
+            CONF_TEXT=$(echo "$CONF_JSON" | grep -o '"conf":"[^"]*"' | cut -d '"' -f 4 | sed 's/\\n/\n/g' || true)
+        fi
+        if [ -n "$CONF_TEXT" ]; then
+            echo "$CONF_TEXT" > "$PROFILE_FILE"
+            echo "[+] Base WARP profile successfully generated & parsed via WarpGen Cloud API!"
+            return 0
+        fi
+    fi
+    echo "[!] WarpGen Cloud API fallback request failed."
+    return 1
+}
+
 register_account() {
     echo ""
     echo "======================================================================"
@@ -217,87 +234,87 @@ register_account() {
         fi
     fi
 
+    CLOUD_SUCCESS=0
+
     if [ ! -f "$ACCOUNT_FILE" ]; then
         # Pre-check API reachability
         echo "[*] Checking reachability of api.cloudflareclient.com..."
         if ! curl -s --connect-timeout 5 --max-time 5 -o /dev/null https://api.cloudflareclient.com 2>/dev/null; then
-            echo ""
-            echo "[!] Cannot reach api.cloudflareclient.com."
-            echo "    Your network is blocking Cloudflare's WARP registration server."
-            echo ""
-            echo "    Option A: Switch to mobile hotspot, run the script there once,"
-            echo "              then copy wgcf-account.toml back here and run again."
-            echo "    Option B: Ask someone on an open network to run wgcf register"
-            echo "              and send you their wgcf-account.toml file."
-            echo "    Option C: Place an existing wgcf-profile.conf here and run again."
-            echo ""
-            printf "  Press Enter to exit, or type SKIP to try anyway: "
-            read -r skip_choice
-            if [ "$(echo "$skip_choice" | tr '[:lower:]' '[:upper:]')" != "SKIP" ]; then
-                exit 1
+            echo "[!] Cannot reach api.cloudflareclient.com on port 443 (Blocked by ISP)."
+            if get_warpgen_profile_cloud; then
+                CLOUD_SUCCESS=1
+            else
+                echo ""
+                echo "[!] Registration server blocked and Cloud API fallback unavailable."
+                echo "    Option A: Switch to mobile hotspot, run the script there once."
+                echo "    Option B: Place an existing wgcf-profile.conf here and run again."
+                printf "  Press Enter to exit, or type SKIP to try anyway: "
+                read -r skip_choice
+                if [ "$(echo "$skip_choice" | tr '[:lower:]' '[:upper:]')" != "SKIP" ]; then
+                    exit 1
+                fi
             fi
-            echo "[!] Skipping pre-check. Attempting registration anyway..."
         else
             echo "[+] api.cloudflareclient.com is reachable. Proceeding with registration."
         fi
 
-        echo "[*] Registering new Cloudflare WARP account..."
-        set +e
-        REG_OUTPUT=$("$WGCF_BIN" register --accept-tos 2>&1)
-        REG_EXIT=$?
-        set -e
+        if [ "$CLOUD_SUCCESS" -eq 0 ]; then
+            echo "[*] Registering new Cloudflare WARP account..."
+            set +e
+            REG_OUTPUT=$("$WGCF_BIN" register --accept-tos 2>&1)
+            REG_EXIT=$?
+            set -e
 
-        if [ $REG_EXIT -ne 0 ]; then
-            echo ""
-            echo "[-] Registration failed. Diagnosing error..."
-            if echo "$REG_OUTPUT" | grep -qiE "refused|connectex|No connection|actively refused"; then
-                echo "[-] Connection was actively refused by the ISP or network firewall."
-                echo "    The /reg API path is being specifically blocked."
-                echo "    Switch to mobile hotspot or obtain wgcf-account.toml from another network."
-            elif echo "$REG_OUTPUT" | grep -qiE "timeout|timed out|deadline"; then
-                echo "[-] Connection timed out waiting for Cloudflare's server."
-                echo "    Try again in a few minutes or switch to mobile hotspot."
-            elif echo "$REG_OUTPUT" | grep -qiE "TLS|certificate|x509|ssl|handshake"; then
-                echo "[-] TLS handshake failed. A proxy or firewall is intercepting HTTPS."
-                echo "    Try disabling antivirus SSL scanning or switch to mobile hotspot."
-            elif echo "$REG_OUTPUT" | grep -qiE "429|rate limit|too many"; then
-                echo "[-] Cloudflare rate-limited this registration attempt."
-                echo "    Wait 10 to 15 minutes and try again."
+            if [ $REG_EXIT -ne 0 ]; then
+                echo "[!] Local wgcf registration failed. Attempting Cloud API Fallback..."
+                if get_warpgen_profile_cloud; then
+                    CLOUD_SUCCESS=1
+                else
+                    echo "[-] Registration failed and Cloud API fallback failed."
+                    exit 1
+                fi
             else
-                echo "[-] Unexpected error: $REG_OUTPUT"
+                echo "[+] Cloudflare WARP account registered successfully."
             fi
-            exit 1
         fi
-
-        echo "[+] Cloudflare WARP account registered successfully."
     else
         echo "[+] Existing wgcf-account.toml found. Skipping registration."
     fi
 
-    echo "[*] Generating base WireGuard profile..."
-    set +e
-    GEN_OUTPUT=$("$WGCF_BIN" generate 2>&1)
-    GEN_EXIT=$?
-    set -e
+    if [ "$CLOUD_SUCCESS" -eq 0 ] && [ ! -f "$PROFILE_FILE" ]; then
+        echo "[*] Generating base WireGuard profile..."
+        set +e
+        GEN_OUTPUT=$("$WGCF_BIN" generate 2>&1)
+        GEN_EXIT=$?
+        set -e
 
-    if [ ! -f "$PROFILE_FILE" ]; then
-        echo "[-] wgcf generate ran but wgcf-profile.conf was not created."
-        echo "    The account file may be corrupt or revoked."
-        echo "    Delete wgcf-account.toml and run again."
-        [ -n "$GEN_OUTPUT" ] && echo "    Raw error: $GEN_OUTPUT"
-        exit 1
+        if [ ! -f "$PROFILE_FILE" ]; then
+            echo "[!] Profile generation failed. Attempting Cloud API Fallback..."
+            if ! get_warpgen_profile_cloud; then
+                echo "[-] Profile generation failed and Cloud API fallback failed."
+                exit 1
+            fi
+        fi
     fi
 
-    PRIVATE_KEY=$(grep "PrivateKey" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
-    ADDRESS=$(grep "Address" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+    PRIVATE_KEY=$(grep "PrivateKey" "$PROFILE_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d ' ')
+    ADDRESS=$(grep "Address" "$PROFILE_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d ' ')
     DNS=$(grep "DNS" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
-    PUBLIC_KEY=$(grep "PublicKey" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
-    RESERVED=$(grep "Reserved" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ' 2>/dev/null || true)
+    PUBLIC_KEY=$(grep "PublicKey" "$PROFILE_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d ' ')
+    RESERVED=$(grep "Reserved" "$PROFILE_FILE" 2>/dev/null | cut -d '=' -f 2 | tr -d ' ' 2>/dev/null || true)
 
     if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$ADDRESS" ]; then
-        echo "[-] Profile file created but is missing required keys. It may be corrupt."
-        echo "    Delete both wgcf-account.toml and wgcf-profile.conf and run again."
-        exit 1
+        echo "[!] Profile missing keys. Attempting Cloud API Fallback..."
+        if get_warpgen_profile_cloud; then
+            PRIVATE_KEY=$(grep "PrivateKey" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+            ADDRESS=$(grep "Address" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+            DNS=$(grep "DNS" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+            PUBLIC_KEY=$(grep "PublicKey" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ')
+            RESERVED=$(grep "Reserved" "$PROFILE_FILE" | cut -d '=' -f 2 | tr -d ' ' 2>/dev/null || true)
+        else
+            echo "[-] Profile file created but is missing required keys."
+            exit 1
+        fi
     fi
 
     echo "[+] Profile parameters extracted successfully."

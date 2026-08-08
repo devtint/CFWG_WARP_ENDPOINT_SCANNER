@@ -279,6 +279,28 @@ def download_wgcf():
         sys.exit(1)
 
 
+def get_warpgen_profile_cloud(profile_path):
+    print("[*] Attempting automatic Cloud API fallback via WarpGen (https://warp-conf-gen.vercel.app)...")
+    try:
+        req = urllib.request.Request(
+            "https://warp-conf-gen.vercel.app/api/generate",
+            data=b"",
+            headers={"User-Agent": "WARP-Scanner-Python"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            conf_str = data.get("conf")
+            if conf_str:
+                Path(profile_path).write_text(conf_str, encoding="utf-8")
+                parsed = read_wgcf_profile(profile_path)
+                if parsed:
+                    print("[+] Base WARP profile successfully generated & parsed via WarpGen Cloud API!")
+                    return parsed
+    except Exception as e:
+        print(f"[!] WarpGen Cloud API fallback request failed: {e}")
+    return None
+
+
 def register_account():
     print("\n======================================================================")
     print("  Step 2: Cloudflare Account Registration & Key Extraction")
@@ -297,88 +319,73 @@ def register_account():
     if not account_file.exists():
         print("[*] Checking reachability of api.cloudflareclient.com...")
         if not test_tcp_reachable("api.cloudflareclient.com", 443, timeout=5):
-            print("")
-            print("[!] Cannot reach api.cloudflareclient.com on port 443.")
-            print("    Your network is blocking Cloudflare's WARP registration server.")
-            print("")
-            print("    Option A: Switch to mobile hotspot, run the script there once,")
-            print("              then copy wgcf-account.toml back here and run again.")
-            print("    Option B: Ask someone on an open network to run wgcf register")
-            print("              and send you their wgcf-account.toml file.")
-            print("    Option C: Place an existing wgcf-profile.conf here and run again.")
-            print("")
-            choice = input("  Press Enter to exit, or type SKIP to try anyway: ").strip().upper()
-            if choice != "SKIP":
-                sys.exit(1)
-            print("[!] Skipping pre-check. Attempting registration anyway...")
+            print("[!] Cannot reach api.cloudflareclient.com on port 443 (Blocked by ISP).")
+            existing = get_warpgen_profile_cloud(profile_file)
+            if not existing:
+                print("\n[!] Registration server blocked and Cloud API fallback unavailable.")
+                print("    Option A: Switch to mobile hotspot, run the script there once.")
+                print("    Option B: Place an existing wgcf-profile.conf here and run again.")
+                choice = input("  Press Enter to exit, or type SKIP to try registration anyway: ").strip().upper()
+                if choice != "SKIP":
+                    sys.exit(1)
+                print("[!] Skipping pre-check. Attempting registration anyway...")
         else:
             print("[+] api.cloudflareclient.com is reachable. Proceeding with registration.")
 
-        print("[*] Registering new Cloudflare WARP account via wgcf...")
+        if not existing:
+            print("[*] Registering new Cloudflare WARP account via wgcf...")
+            try:
+                result = subprocess.run(
+                    [str(WGCF_BIN), "register", "--accept-tos"],
+                    cwd=WORKING_DIR, capture_output=True, text=True, timeout=25
+                )
+                if result.returncode != 0:
+                    print("[!] Local wgcf registration failed. Attempting Cloud API Fallback...")
+                    existing = get_warpgen_profile_cloud(profile_file)
+                    if not existing:
+                        print("[-] Registration failed and Cloud API fallback unavailable.")
+                        sys.exit(1)
+                else:
+                    print("[+] Cloudflare WARP account registered successfully.")
+            except subprocess.TimeoutExpired:
+                print("[!] Registration timed out. Attempting Cloud API Fallback...")
+                existing = get_warpgen_profile_cloud(profile_file)
+                if not existing:
+                    print("[-] Registration timed out and Cloud API fallback failed.")
+                    sys.exit(1)
+
+    if not existing:
+        # Generate profile via wgcf if not already obtained from cloud
+        print("[*] Generating WireGuard profile via wgcf...")
         try:
             result = subprocess.run(
-                [str(WGCF_BIN), "register", "--accept-tos"],
-                cwd=WORKING_DIR, capture_output=True, text=True, timeout=25
+                [str(WGCF_BIN), "generate"],
+                cwd=WORKING_DIR, capture_output=True, text=True, timeout=15
             )
-            if result.returncode != 0:
-                combined = result.stdout + result.stderr
-                print("")
-                print("[-] Registration failed. Diagnosing...")
-                if any(k in combined for k in ["refused", "connectex", "actively refused", "No connection"]):
-                    print("[-] Connection actively refused by ISP or network firewall.")
-                    print("    The /reg API path is being specifically blocked.")
-                    print("    Switch to mobile hotspot, or obtain wgcf-account.toml from another network.")
-                elif any(k in combined for k in ["timeout", "timed out", "deadline"]):
-                    print("[-] Connection timed out waiting for Cloudflare's server.")
-                    print("    Try again in a few minutes or switch to mobile hotspot.")
-                elif any(k in combined for k in ["TLS", "certificate", "x509", "ssl", "handshake"]):
-                    print("[-] TLS handshake failed. A proxy or firewall is intercepting HTTPS.")
-                    print("    Try disabling antivirus SSL scanning or switch to mobile hotspot.")
-                elif any(k in combined for k in ["429", "rate limit", "too many"]):
-                    print("[-] Cloudflare rate-limited this registration attempt.")
-                    print("    Wait 10 to 15 minutes and try again.")
-                else:
-                    print(f"[-] Unexpected error: {combined.strip()}")
-                sys.exit(1)
         except subprocess.TimeoutExpired:
-            print("[-] Registration timed out after 25 seconds.")
-            print("    The network may be throttling the connection. Try on mobile hotspot.")
-            sys.exit(1)
+            print("[!] Profile generation timed out. Attempting Cloud API Fallback...")
+            existing = get_warpgen_profile_cloud(profile_file)
+            if not existing:
+                sys.exit(1)
 
-        print("[+] Cloudflare WARP account registered successfully.")
-    else:
-        print("[+] Existing wgcf-account.toml found. Skipping registration.")
+        if not existing and not profile_file.exists():
+            print("[!] Profile generation failed. Attempting Cloud API Fallback...")
+            existing = get_warpgen_profile_cloud(profile_file)
+            if not existing:
+                sys.exit(1)
 
-    # Generate profile
-    print("[*] Generating WireGuard profile via wgcf...")
-    try:
-        result = subprocess.run(
-            [str(WGCF_BIN), "generate"],
-            cwd=WORKING_DIR, capture_output=True, text=True, timeout=15
-        )
-    except subprocess.TimeoutExpired:
-        print("[-] Profile generation timed out.")
-        print("    Delete wgcf-account.toml and run again to start fresh.")
-        sys.exit(1)
+        if not existing:
+            existing = read_wgcf_profile(profile_file)
+            if not existing:
+                print("[!] Profile missing keys. Attempting Cloud API Fallback...")
+                existing = get_warpgen_profile_cloud(profile_file)
+                if not existing:
+                    sys.exit(1)
 
-    if not profile_file.exists():
-        print("[-] wgcf generate ran but wgcf-profile.conf was not created.")
-        print("    The account file may be corrupt or revoked.")
-        print("    Delete wgcf-account.toml and run again.")
-        if result.stderr:
-            print(f"    Raw error: {result.stderr.strip()}")
-        sys.exit(1)
-
-    profile = read_wgcf_profile(profile_file)
-    if not profile:
-        print("[-] Profile file created but is missing required keys. It may be corrupt.")
-        print("    Delete both wgcf-account.toml and wgcf-profile.conf and run again.")
-        sys.exit(1)
-
-    print("[+] Profile generated and parsed successfully.")
-    print(f"    Address   : {profile['Address']}")
-    print(f"    PublicKey : {profile['PublicKey']}")
-    return profile
+    print("[+] Base profile generated and parsed successfully.")
+    print(f"    Address   : {existing['Address']}")
+    print(f"    PublicKey : {existing['PublicKey']}")
+    return existing
 
 
 def probe_endpoint(ip, port, timeout=0.8):

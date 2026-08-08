@@ -459,6 +459,27 @@ function Read-WgcfProfile {
     return @{ PrivateKey = $pk; Address = $ad; DNS = $dn; PublicKey = $pub; Reserved = $res }
 }
 
+# Internal helper: Cloud API Fallback via WarpGen (https://warp-conf-gen.vercel.app)
+function Get-WarpGenProfileCloud {
+    param([string]$ProfilePath)
+    Write-Info "Attempting cloud fallback generation via WarpGen API (https://warp-conf-gen.vercel.app)..."
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+        $resp = Invoke-RestMethod -Uri "https://warp-conf-gen.vercel.app/api/generate" -Method Post -TimeoutSec 10
+        if ($resp -and $resp.conf) {
+            Set-Content -Path $ProfilePath -Value $resp.conf -Encoding ASCII -Force
+            $parsed = Read-WgcfProfile -Path $ProfilePath
+            if ($parsed) {
+                Write-Success "Base WARP profile successfully generated & parsed via WarpGen Cloud API!"
+                return $parsed
+            }
+        }
+    } catch {
+        Write-Warn "WarpGen Cloud API fallback request failed: $_"
+    }
+    return $null
+}
+
 try {
     Write-Header "Step 2: Cloudflare Account Registration & Key Extraction"
 
@@ -475,163 +496,96 @@ try {
     } else {
         # ------------------------------------------------------------------
         # PRE-CHECK: test API reachability BEFORE running wgcf
-        # This gives a clean, instant error instead of waiting for wgcf to
-        # fail with a cryptic Go stack trace.
         # ------------------------------------------------------------------
         Write-Info "Checking reachability of api.cloudflareclient.com before registration..."
         $apiReachable = Test-TcpReachable -Hostname "api.cloudflareclient.com" -Port 443 -TimeoutMs 5000
 
         if (-not $apiReachable) {
-            Write-Host ""
-            Write-Warn "Cannot reach api.cloudflareclient.com on port 443."
-            Write-Host ""
-            Write-Host "  What this means:" -ForegroundColor Yellow
-            Write-Host "  Your current network is blocking Cloudflare's WARP registration server." -ForegroundColor Yellow
-            Write-Host "  wgcf cannot create a new account without reaching this server." -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "  Your options:" -ForegroundColor Cyan
-            Write-Host "  A) Switch to mobile hotspot, run this script there once, then copy" -ForegroundColor Cyan
-            Write-Host "     wgcf-account.toml back to this folder and run the script again." -ForegroundColor Cyan
-            Write-Host "  B) Ask someone on an open network to run wgcf register and send" -ForegroundColor Cyan
-            Write-Host "     you their wgcf-account.toml file." -ForegroundColor Cyan
-            Write-Host "  C) Place an existing wgcf-profile.conf in this folder and run again." -ForegroundColor Cyan
-            Write-Host ""
+            Write-Warn "Cannot reach api.cloudflareclient.com on port 443 (Blocked by ISP)."
+            Write-Info "Triggering automatic Cloud API Fallback via WarpGen..."
+            $existingProfile = Get-WarpGenProfileCloud -ProfilePath $profileFile
 
-            $choice = Read-Host "  Press Enter to exit, or type SKIP to try registration anyway"
-            if ($choice.Trim().ToUpper() -ne "SKIP") {
-                exit 1
+            if (-not $existingProfile) {
+                Write-Host ""
+                Write-Err "Registration server blocked and Cloud API fallback unavailable."
+                Write-Host "  Options:" -ForegroundColor Cyan
+                Write-Host "  1. Switch to mobile hotspot and run the script there once." -ForegroundColor Cyan
+                Write-Host "  2. Place an existing wgcf-profile.conf in this folder and rerun." -ForegroundColor Cyan
+                Write-Host ""
+                $choice = Read-Host "  Press Enter to exit, or type SKIP to force local wgcf registration anyway"
+                if ($choice.Trim().ToUpper() -ne "SKIP") {
+                    exit 1
+                }
             }
-            Write-Warn "Skipping pre-check. Attempting registration anyway..."
         } else {
             Write-Success "api.cloudflareclient.com is reachable. Proceeding with registration."
         }
 
         # ------------------------------------------------------------------
-        # REGISTRATION
+        # REGISTRATION (If cloud fallback was not used)
         # ------------------------------------------------------------------
-        if (-not (Test-Path $accountFile)) {
-            Write-Info "Registering new Cloudflare WARP account via wgcf..."
-
-            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pinfo.FileName        = $WGCF_EXE
-            $pinfo.Arguments       = "register --accept-tos"
-            $pinfo.WorkingDirectory = $WORKING_DIR
-            $pinfo.UseShellExecute  = $false
-            $pinfo.RedirectStandardOutput = $true
-            $pinfo.RedirectStandardError  = $true
-
-            $proc   = [System.Diagnostics.Process]::Start($pinfo)
-            $stdOut = $proc.StandardOutput.ReadToEnd()
-            $stdErr = $proc.StandardError.ReadToEnd()
-            $registerFinished = $proc.WaitForExit(25000)
-            $combined = "$stdOut $stdErr"
-
-            if (-not $registerFinished) {
-                try { $proc.Kill() } catch {}
-                Write-Err "Registration timed out after 25 seconds."
-                Write-Host ""
-                Write-Host "  The network is responding but very slowly. This often means" -ForegroundColor Yellow
-                Write-Host "  the ISP is throttling rather than outright blocking the connection." -ForegroundColor Yellow
-                Write-Host "  Try on a different network or wait a few minutes and try again." -ForegroundColor Cyan
-                exit 1
-            }
-
-            if ($proc.ExitCode -ne 0) {
-                Write-Host ""
-                Write-Host "  Registration failed. Reading error output..." -ForegroundColor Yellow
-                Write-Host ""
-
-                if ($combined -match "refused|connectex|No connection could be made|actively refused") {
-                    Write-Err "Connection was actively refused by the ISP or network firewall."
-                    Write-Host ""
-                    Write-Host "  The pre-check passed but the actual registration was blocked." -ForegroundColor Yellow
-                    Write-Host "  The ISP may be doing deep packet inspection and blocking" -ForegroundColor Yellow
-                    Write-Host "  specifically the /reg API path while allowing other HTTPS traffic." -ForegroundColor Yellow
-                    Write-Host ""
-                    Write-Host "  Option A: Switch to mobile hotspot and run this script there first." -ForegroundColor Cyan
-                    Write-Host "  Option B: Place someone else's wgcf-account.toml here and rerun." -ForegroundColor Cyan
-                    Write-Host "  Option C: Place a ready wgcf-profile.conf here and rerun." -ForegroundColor Cyan
-                }
-                elseif ($combined -match "timeout|timed out|deadline|context deadline") {
-                    Write-Err "Registration connection timed out while waiting for a response."
-                    Write-Host ""
-                    Write-Host "  The server was reached but did not respond in time." -ForegroundColor Yellow
-                    Write-Host "  Try again in a few minutes, or switch to mobile hotspot." -ForegroundColor Cyan
-                }
-                elseif ($combined -match "TLS|certificate|x509|ssl|handshake") {
-                    Write-Err "TLS handshake failed. A proxy or firewall is intercepting HTTPS."
-                    Write-Host ""
-                    Write-Host "  Something between your computer and Cloudflare is intercepting" -ForegroundColor Yellow
-                    Write-Host "  the encrypted connection. This could be a corporate firewall," -ForegroundColor Yellow
-                    Write-Host "  antivirus SSL scanning, or a network proxy." -ForegroundColor Yellow
-                    Write-Host ""
-                    Write-Host "  Try disabling any antivirus SSL scanning or switch to mobile hotspot." -ForegroundColor Cyan
-                }
-                elseif ($combined -match "rate limit|too many|429") {
-                    Write-Err "Cloudflare rate-limited this registration attempt."
-                    Write-Host ""
-                    Write-Host "  Too many registration attempts were made from this IP recently." -ForegroundColor Yellow
-                    Write-Host "  Wait 10 to 15 minutes and try again." -ForegroundColor Cyan
-                }
-                else {
-                    Write-Err "wgcf register failed with an unrecognised error."
-                    Write-Host ""
-                    Write-Host "  Error output:" -ForegroundColor Yellow
-                    Write-Host "  $combined" -ForegroundColor DarkGray
-                }
-
-                exit 1
-            }
-
-            Write-Success "Cloudflare WARP account registered successfully."
-
-        } else {
-            Write-Success "Existing wgcf-account.toml found. Skipping registration step."
-        }
-
-        # ------------------------------------------------------------------
-        # PROFILE GENERATION
-        # ------------------------------------------------------------------
-        Write-Info "Generating WireGuard profile via wgcf..."
-
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName        = $WGCF_EXE
-        $pinfo.Arguments       = "generate"
-        $pinfo.WorkingDirectory = $WORKING_DIR
-        $pinfo.UseShellExecute  = $false
-        $pinfo.RedirectStandardOutput = $true
-        $pinfo.RedirectStandardError  = $true
-
-        $proc        = [System.Diagnostics.Process]::Start($pinfo)
-        $genFinished = $proc.WaitForExit(15000)
-        $genErr      = $proc.StandardError.ReadToEnd()
-
-        if (-not $genFinished) {
-            try { $proc.Kill() } catch {}
-            Write-Err "Profile generation timed out."
-            Write-Host "  Delete wgcf-account.toml and run again to start fresh." -ForegroundColor Cyan
-            exit 1
-        }
-
-        if (-not (Test-Path $profileFile)) {
-            Write-Err "wgcf generate ran but wgcf-profile.conf was not created."
-            Write-Host ""
-            Write-Host "  The account file may be corrupt or the account may have been revoked." -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "  Delete wgcf-account.toml from this folder and run the script again" -ForegroundColor Cyan
-            Write-Host "  to register a fresh account." -ForegroundColor Cyan
-            if ($genErr) { Write-Host "  Raw error: $genErr" -ForegroundColor DarkGray }
-            exit 1
-        }
-
-        Write-Success "wgcf-profile.conf generated."
-        $existingProfile = Read-WgcfProfile -Path $profileFile
-
         if (-not $existingProfile) {
-            Write-Err "Profile file was created but is missing required keys."
-            Write-Host ""
-            Write-Host "  Delete both wgcf-account.toml and wgcf-profile.conf and run again." -ForegroundColor Cyan
-            exit 1
+            if (-not (Test-Path $accountFile)) {
+                Write-Info "Registering new Cloudflare WARP account via wgcf..."
+
+                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pinfo.FileName        = $WGCF_EXE
+                $pinfo.Arguments       = "register --accept-tos"
+                $pinfo.WorkingDirectory = $WORKING_DIR
+                $pinfo.UseShellExecute  = $false
+                $pinfo.RedirectStandardOutput = $true
+                $pinfo.RedirectStandardError  = $true
+
+                $proc   = [System.Diagnostics.Process]::Start($pinfo)
+                $stdOut = $proc.StandardOutput.ReadToEnd()
+                $stdErr = $proc.StandardError.ReadToEnd()
+                $registerFinished = $proc.WaitForExit(25000)
+                $combined = "$stdOut $stdErr"
+
+                if (-not $registerFinished -or $proc.ExitCode -ne 0) {
+                    Write-Warn "Local wgcf registration failed. Attempting Cloud API Fallback..."
+                    $existingProfile = Get-WarpGenProfileCloud -ProfilePath $profileFile
+                    if (-not $existingProfile) {
+                        Write-Err "Registration failed and Cloud API fallback failed. Error: $combined"
+                        exit 1
+                    }
+                } else {
+                    Write-Success "Cloudflare WARP account registered successfully."
+                }
+            } else {
+                Write-Success "Existing wgcf-account.toml found. Skipping registration step."
+            }
+
+            # ------------------------------------------------------------------
+            # PROFILE GENERATION (if not already obtained from cloud API)
+            # ------------------------------------------------------------------
+            if (-not $existingProfile) {
+                Write-Info "Generating WireGuard profile via wgcf..."
+
+                $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pinfo.FileName        = $WGCF_EXE
+                $pinfo.Arguments       = "generate"
+                $pinfo.WorkingDirectory = $WORKING_DIR
+                $pinfo.UseShellExecute  = $false
+                $pinfo.RedirectStandardOutput = $true
+                $pinfo.RedirectStandardError  = $true
+
+                $proc        = [System.Diagnostics.Process]::Start($pinfo)
+                $genFinished = $proc.WaitForExit(15000)
+                $genErr      = $proc.StandardError.ReadToEnd()
+
+                if (-not $genFinished -or -not (Test-Path $profileFile)) {
+                    Write-Warn "wgcf generate failed. Attempting Cloud API Fallback..."
+                    $existingProfile = Get-WarpGenProfileCloud -ProfilePath $profileFile
+                    if (-not $existingProfile) {
+                        Write-Err "Profile generation failed. Delete wgcf-account.toml and try again."
+                        exit 1
+                    }
+                } else {
+                    Write-Success "wgcf-profile.conf generated."
+                    $existingProfile = Read-WgcfProfile -Path $profileFile
+                }
+            }
         }
     }
 

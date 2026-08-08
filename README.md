@@ -1,8 +1,8 @@
 # Cloudflare WARP Mass Endpoint Scanner
 
-Author: Tint Naing Win
-Telegram: @BadCodeWriter
-Repository: https://github.com/devtint/CFWG_WARP_ENDPOINT_SCANNER
+Author: Tint Naing Win  
+Telegram: @BadCodeWriter  
+Repository: https://github.com/devtint/CFWG_WARP_ENDPOINT_SCANNER  
 
 This repository provides automated scanner tools to discover fast Cloudflare WARP endpoints, generate WireGuard configuration profiles, and measure connection latency on Windows, Linux, and macOS.
 
@@ -72,6 +72,23 @@ Option C: Running on Linux or macOS (Bash Terminal)
 chmod +x warp_scanner.sh && sudo ./warp_scanner.sh
 ```
 
+KEY ARCHITECTURAL FEATURES
+
+1. AUTOMATIC CLOUD API FALLBACK (WARPGEN)
+In restricted networks where ISPs block Cloudflare's registration API (`api.cloudflareclient.com`), local `wgcf` binary calls will fail. All scanner scripts feature an automatic fallback to the WarpGen Cloud API (`https://warp-conf-gen.vercel.app/api/generate`). When local registration is blocked, the scanner automatically fetches a fresh base WARP WireGuard profile via cloud API and proceeds with the scan seamlessly without requiring mobile hotspot or manual file copying.
+
+2. DUAL-STAGE LATENCY ACCURACY
+- **Probe RTT (Pre-scan)**: Raw socket probe round-trip latency measured during initial mass discovery in Step 3.
+- **Tunnel RTT (1.1.1.1)**: True end-to-end ICMP ping latency measured through the active WireGuard tunnel interface in Step 5.
+- Results in terminal tables and exported CSV/TXT reports are sorted strictly by verified **Tunnel RTT**.
+
+3. AUTOMATED TEST SUITE (`tests/`)
+An offline test suite is provided in the `tests/` directory to validate syntax, CIDR subnet expansion (12,192 targets), profile parsing, and WireGuard configuration generation without requiring active tunnels or root/admin privileges:
+```bash
+python tests/test_scanner.py
+powershell -ExecutionPolicy Bypass -File tests/Test-WARPScanner.ps1
+```
+
 TOOL COMPARISON & RECOMMENDATION
 If you are using Windows, WARP-Scanner.ps1 is the primary recommended tool because:
 1. Zero Installation: Built directly into Windows without installing Python or extra tools.
@@ -91,8 +108,8 @@ To maintain complete user trust:
 WHERE TO FIND YOUR WORKING CONFIGURATIONS
 After the scan completes, your results are saved automatically inside the script directory:
 * Working_Configs folder: Contains ready-to-use .conf files. Import any file from this folder directly into your WireGuard application.
-* working_endpoints.csv: Complete summary spreadsheet sorted by lowest latency.
-* working_endpoints.txt: Text summary report with IP, port, latency, and datacenter location.
+* working_endpoints.csv: Complete summary spreadsheet sorted by lowest Tunnel RTT.
+* working_endpoints.txt: Text summary report with IP, port, probe latency, tunnel RTT, and datacenter location.
 
 
 ======================================================================
@@ -141,10 +158,13 @@ Windows အတွက် (PowerShell)
 
 ၅။ Menu ပေါ်လာပါက 1 ဟု ရိုက်ပြီး Enter နှိပ်၍ စကန်ဖတ်ခြင်း စတင်ပါ။
 
+အလိုအလျောက် Cloud API Fallback (WarpGen) စနစ်
+အကယ်၍ သင့် ISP သို့မဟုတ် Network က Cloudflare account ပြုလုပ်သည့် Server (`api.cloudflareclient.com`) ကို ပိတ်ဆို့ထားပါက Script များသည် WarpGen Cloud API (`https://warp-conf-gen.vercel.app/api/generate`) သို့ အလိုအလျောက် ချိတ်ဆက်၍ Base WARP Profile ကို ရယူပေးမည် ဖြစ်ပါသည်။ ထို့ကြောင့် မိုဘိုင်းဟော့စပေါ့ ပြောင်းရန် မလိုဘဲ စကန်ဖတ်ခြင်းကို အလိုအလျောက် ဆက်လက် လုပ်ဆောင်ပေးနိုင်ပါသည်။
+
 အသုံးပြုနိုင်သော ရလဒ်ဖိုင်များ ရှာဖွေနည်း
 စကန်ဖတ်ခြင်း ပြီးဆုံးပါက အောက်ပါ ဖိုင်များ တိုက်ရိုက် ထွက်ရှိလာမည် ဖြစ်ပါသည်။
 * Working_Configs ဖိုင်တွဲ - ချိတ်ဆက်မှု အဆင်ပြေသော WireGuard .conf ဖိုင်များ သိမ်းဆည်းထားသည့် နေရာ ဖြစ်ပါသည်။ ထိုဖိုင်များကို WireGuard App ထဲသို့ တိုက်ရိုက် Import လုပ်၍ အသုံးပြုနိုင်ပါသည်။
-* working_endpoints.csv - လိုင်းအမြန်နှုန်း Ping latency အလိုက် အစဉ်လိုက် စီပေးထားသော ဇယားဖိုင် ဖြစ်ပါသည်။
+* working_endpoints.csv - စမ်းသပ်အောင်မြင်သော Endpoint များ၊ Probe Latency နှင့် စစ်မှန်သော Tunnel RTT အလိုက် စီပေးထားသော ဇယားဖိုင် ဖြစ်ပါသည်။
 * working_endpoints.txt - စမ်းသပ်အောင်မြင်သော IP များနှင့် တည်နေရာ အချက်အလက်များ ပါဝင်သော စာသားဖိုင် ဖြစ်ပါသည်။
 
 

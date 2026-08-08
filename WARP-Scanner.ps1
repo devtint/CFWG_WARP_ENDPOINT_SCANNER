@@ -802,12 +802,12 @@ Endpoint = $($cand.Endpoint)
         Set-Content -Path $confFilePath -Value $confText -Encoding ASCII -Force
 
         $generatedConfs.Add([PSCustomObject]@{
-            Endpoint     = $cand.Endpoint
-            IP           = $cand.IP
-            Port         = $cand.Port
-            ConfPath     = $confFilePath
-            ConfName     = [System.IO.Path]::GetFileNameWithoutExtension($confFileName)
-            InitLatency  = $cand.LatencyMs
+            Endpoint       = $cand.Endpoint
+            IP             = $cand.IP
+            Port           = $cand.Port
+            ConfPath       = $confFilePath
+            ConfName       = [System.IO.Path]::GetFileNameWithoutExtension($confFileName)
+            ProbeLatencyMs = $cand.LatencyMs
         })
     }
 
@@ -837,6 +837,7 @@ try {
 
         Write-Host ""
         Write-Host "[$testIndex/$($generatedConfs.Count)] Testing Endpoint: $endpoint ($tunnelName)" -ForegroundColor Yellow
+        Write-Info "Pre-scan Probe Latency: $($item.ProbeLatencyMs) ms"
 
         $script:ActiveTunnelName = $tunnelName
 
@@ -924,22 +925,24 @@ try {
         # 5.4 Evaluate Tunnel Health
         if ($pingSuccess -and ($warpStatus -eq "on" -or $warpStatus -eq "plus")) {
             Write-Success "VALID WARP ENDPOINT FOUND!"
-            Write-Host "   - Endpoint   : $endpoint" -ForegroundColor Green
-            Write-Host "   - Ping 1.1.1.1: SUCCESS ($avgPingRtt ms)" -ForegroundColor Green
-            Write-Host "   - WARP Trace : $warpStatus (Colo: $colo)" -ForegroundColor Green
+            Write-Host "   - Endpoint       : $endpoint" -ForegroundColor Green
+            Write-Host "   - Probe Latency  : $($item.ProbeLatencyMs) ms" -ForegroundColor Gray
+            Write-Host "   - Tunnel RTT 1.1.1.1: $avgPingRtt ms" -ForegroundColor Green
+            Write-Host "   - WARP Trace     : $warpStatus (Colo: $colo)" -ForegroundColor Green
 
             # Copy successful config to Working_Configs folder
             $destWorkingConf = Join-Path $SUCCESS_CONF_DIR ([System.IO.Path]::GetFileName($confPath))
             Copy-Item -Path $confPath -Destination $destWorkingConf -Force
 
             $verifiedEndpoints.Add([PSCustomObject]@{
-                Endpoint   = $endpoint
-                IP         = $item.IP
-                Port       = $item.Port
-                LatencyMs  = $avgPingRtt
-                WarpStatus = $warpStatus
-                Location   = $colo
-                ConfigFile = [System.IO.Path]::GetFileName($confPath)
+                Endpoint       = $endpoint
+                IP             = $item.IP
+                Port           = $item.Port
+                ProbeLatencyMs = $item.ProbeLatencyMs
+                TunnelRttMs    = $avgPingRtt
+                WarpStatus     = $warpStatus
+                Location       = $colo
+                ConfigFile     = [System.IO.Path]::GetFileName($confPath)
             })
         } else {
             Write-Err "Tunnel validation failed for $endpoint (Ping: $pingSuccess, WARP Trace: $warpStatus)"
@@ -962,17 +965,17 @@ try {
 Write-Header "Step 6: Results Summary & File Export"
 
 if ($verifiedEndpoints.Count -gt 0) {
-    # Sort endpoints by latency ascending
-    $sortedResults = $verifiedEndpoints | Sort-Object LatencyMs
+    # Sort endpoints by verified Tunnel RTT ascending
+    $sortedResults = $verifiedEndpoints | Sort-Object TunnelRttMs
 
     Write-Success "Found $($sortedResults.Count) working Cloudflare WARP endpoints!"
     Write-Host ""
-    Write-Host "Top Performing Endpoints:" -ForegroundColor Yellow
-    Write-Host ("{0,-22} {1,-12} {2,-12} {3,-10} {4,-25}" -f "Endpoint", "Latency (ms)", "WARP Status", "DataCenter", "Config File") -ForegroundColor Cyan
-    Write-Host ("-" * 82) -ForegroundColor Gray
+    Write-Host "Top Performing Endpoints (Sorted by Verified Tunnel RTT):" -ForegroundColor Yellow
+    Write-Host ("{0,-22} {1,-14} {2,-14} {3,-12} {4,-10} {5,-25}" -f "Endpoint", "Probe RTT(ms)", "Tunnel RTT(ms)", "WARP Status", "DataCenter", "Config File") -ForegroundColor Cyan
+    Write-Host ("-" * 98) -ForegroundColor Gray
 
     foreach ($res in $sortedResults) {
-        Write-Host ("{0,-22} {1,-12} {2,-12} {3,-10} {4,-25}" -f $res.Endpoint, $res.LatencyMs, $res.WarpStatus, $res.Location, $res.ConfigFile) -ForegroundColor Green
+        Write-Host ("{0,-22} {1,-14} {2,-14} {3,-12} {4,-10} {5,-25}" -f $res.Endpoint, $res.ProbeLatencyMs, $res.TunnelRttMs, $res.WarpStatus, $res.Location, $res.ConfigFile) -ForegroundColor Green
     }
 
     # Export to CSV
@@ -983,10 +986,10 @@ if ($verifiedEndpoints.Count -gt 0) {
     $txtLines = @(
         "# Cloudflare WARP Working Endpoints - Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
         "# Total Verified: $($sortedResults.Count)",
-        "#" + ("-" * 60)
+        "#" + ("-" * 80)
     )
     foreach ($res in $sortedResults) {
-        $txtLines += "$($res.Endpoint) | Latency: $($res.LatencyMs) ms | WARP: $($res.WarpStatus) | Datacenter: $($res.Location) | Config: $($res.ConfigFile)"
+        $txtLines += "$($res.Endpoint) | Probe: $($res.ProbeLatencyMs) ms | Tunnel RTT: $($res.TunnelRttMs) ms | WARP: $($res.WarpStatus) | Datacenter: $($res.Location) | Config: $($res.ConfigFile)"
     }
     Set-Content -Path $TXT_OUTPUT_PATH -Value $txtLines -Encoding UTF8 -Force
     Write-Success "Exported TXT summary to: $TXT_OUTPUT_PATH"

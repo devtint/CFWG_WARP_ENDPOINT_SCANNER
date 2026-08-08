@@ -468,7 +468,14 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = {item['endpoint']}
 """
         conf_path.write_text(content, encoding="utf-8")
-        configs.append({"endpoint": item["endpoint"], "ip": item["ip"], "port": item["port"], "path": conf_path, "name": conf_name})
+        configs.append({
+            "endpoint": item["endpoint"],
+            "ip": item["ip"],
+            "port": item["port"],
+            "path": conf_path,
+            "name": conf_name,
+            "probe_latency": item.get("latency", 9999)
+        })
 
     print(f"[+] Created {len(configs)} configuration files in {CONFIG_DIR}")
     return configs
@@ -496,6 +503,7 @@ def test_tunnels(configs, tunnel_wait=4):
     for idx, cfg in enumerate(configs, 1):
         tunnel_name = cfg["path"].stem
         print(f"\n[{idx}/{len(configs)}] Testing Endpoint: {cfg['endpoint']} ({tunnel_name})")
+        print(f"[*] Pre-scan Probe Latency: {cfg['probe_latency']} ms")
 
         try:
             if IS_WINDOWS:
@@ -543,7 +551,7 @@ def test_tunnels(configs, tunnel_wait=4):
                 pass
 
         if ping_ok and warp_status in ["on", "plus"]:
-            print(f"[+] VALID WARP ENDPOINT: {cfg['endpoint']} | Ping: {rtt}ms | WARP: {warp_status} | Location: {location}")
+            print(f"[+] VALID WARP ENDPOINT: {cfg['endpoint']} | Probe: {cfg['probe_latency']}ms | Tunnel RTT: {rtt}ms | WARP: {warp_status} | Location: {location}")
             dest_conf = WORKING_CONF_DIR / cfg["name"]
             shutil.copy(cfg["path"], dest_conf)
 
@@ -551,7 +559,8 @@ def test_tunnels(configs, tunnel_wait=4):
                 "Endpoint": cfg["endpoint"],
                 "IP": cfg["ip"],
                 "Port": cfg["port"],
-                "LatencyMs": rtt,
+                "ProbeLatencyMs": cfg["probe_latency"],
+                "TunnelRttMs": rtt,
                 "WarpStatus": warp_status,
                 "Location": location,
                 "ConfigFile": cfg["name"]
@@ -574,18 +583,24 @@ def export_results(results):
         print("[!] No working endpoints found.")
         return
 
-    results.sort(key=lambda x: x["LatencyMs"])
+    results.sort(key=lambda x: x["TunnelRttMs"])
 
     print(f"\n[+] Found {len(results)} working Cloudflare WARP endpoints!\n")
-    print(f"{'Endpoint':<22} {'Latency (ms)':<12} {'WARP Status':<12} {'Location':<10} {'Config File':<25}")
-    print("-" * 80)
+    print(f"{'Endpoint':<22} {'Probe RTT':<12} {'Tunnel RTT':<12} {'WARP Status':<12} {'Location':<10} {'Config File':<25}")
+    print("-" * 96)
     for r in results:
-        print(f"{r['Endpoint']:<22} {r['LatencyMs']:<12} {r['WarpStatus']:<12} {r['Location']:<10} {r['ConfigFile']:<25}")
+        print(f"{r['Endpoint']:<22} {r['ProbeLatencyMs']:<12} {r['TunnelRttMs']:<12} {r['WarpStatus']:<12} {r['Location']:<10} {r['ConfigFile']:<25}")
 
     with open(CSV_OUTPUT, "w", encoding="utf-8") as f:
-        f.write("Endpoint,IP,Port,LatencyMs,WarpStatus,Location,ConfigFile\n")
+        f.write("Endpoint,IP,Port,ProbeLatencyMs,TunnelRttMs,WarpStatus,Location,ConfigFile\n")
         for r in results:
-            f.write(f"{r['Endpoint']},{r['IP']},{r['Port']},{r['LatencyMs']},{r['WarpStatus']},{r['Location']},{r['ConfigFile']}\n")
+            f.write(f"{r['Endpoint']},{r['IP']},{r['Port']},{r['ProbeLatencyMs']},{r['TunnelRttMs']},{r['WarpStatus']},{r['Location']},{r['ConfigFile']}\n")
+    print(f"[+] Exported CSV: {CSV_OUTPUT}")
+
+    with open(TXT_OUTPUT, "w", encoding="utf-8") as f:
+        f.write(f"# Cloudflare WARP Working Endpoints - Generated {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        for r in results:
+            f.write(f"{r['Endpoint']} | Probe: {r['ProbeLatencyMs']} ms | Tunnel RTT: {r['TunnelRttMs']} ms | WARP: {r['WarpStatus']} | Location: {r['Location']} | Config: {r['ConfigFile']}\n")
     print(f"[+] Exported CSV: {CSV_OUTPUT}")
 
     with open(TXT_OUTPUT, "w", encoding="utf-8") as f:

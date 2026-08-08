@@ -431,7 +431,7 @@ test_tunnels() {
     echo "======================================================================"
 
     rm -f "${CSV_OUTPUT}" "${TXT_OUTPUT}"
-    echo "Endpoint,IP,Port,LatencyMs,WarpStatus,Location,ConfigFile" > "$CSV_OUTPUT"
+    echo "Endpoint,IP,Port,ProbeLatencyMs,TunnelRttMs,WarpStatus,Location,ConfigFile" > "$CSV_OUTPUT"
     echo "# Cloudflare WARP Working Endpoints - Generated $(date)" > "$TXT_OUTPUT"
 
     TOTAL_CONF=$(ls -1 "${CONFIG_DIR}"/*.conf 2>/dev/null | wc -l)
@@ -476,15 +476,15 @@ test_tunnels() {
         fi
 
         if [ "$PING_OK" -eq 1 ] && [ "$WARP_STATUS" != "OFF" ]; then
-            echo "[+] VALID ENDPOINT! Latency: ${LATENCY}ms | WARP: ${WARP_STATUS} | Datacenter: ${LOCATION}"
+            echo "[+] VALID ENDPOINT! Verified Tunnel RTT: ${LATENCY}ms | WARP: ${WARP_STATUS} | Datacenter: ${LOCATION}"
             cp "$conf" "${WORKING_CONF_DIR}/${conf_name}"
             
             endpoint_line=$(grep "Endpoint" "$conf" | cut -d '=' -f 2 | tr -d ' ')
             ip=$(echo "$endpoint_line" | cut -d ':' -f 1)
             port=$(echo "$endpoint_line" | cut -d ':' -f 2)
 
-            echo "${endpoint_line},${ip},${port},${LATENCY},${WARP_STATUS},${LOCATION},${conf_name}" >> "$CSV_OUTPUT"
-            echo "${endpoint_line} | Latency: ${LATENCY} ms | WARP: ${WARP_STATUS} | Datacenter: ${LOCATION} | Config: ${conf_name}" >> "$TXT_OUTPUT"
+            echo "${endpoint_line},${ip},${port},N/A,${LATENCY},${WARP_STATUS},${LOCATION},${conf_name}" >> "$CSV_OUTPUT"
+            echo "${endpoint_line} | Tunnel RTT: ${LATENCY} ms | WARP: ${WARP_STATUS} | Datacenter: ${LOCATION} | Config: ${conf_name}" >> "$TXT_OUTPUT"
         else
             echo "[-] Tunnel verification failed."
         fi
